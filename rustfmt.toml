@@ -1,0 +1,4 @@
+# Only stable options are used so that `cargo fmt` works on the stable toolchain.
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
