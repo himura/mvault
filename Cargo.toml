@@ -1,0 +1,11 @@
+[package]
+name = "mvault"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "mvault command-line tool"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/himura/mvault"
+readme = "README.md"
+
+[dependencies]
