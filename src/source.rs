@@ -323,10 +323,10 @@ fn is_id(value: &str) -> bool {
 }
 
 fn parse_id(what: &str, value: &str) -> Result<u64, Reason> {
-    if is_id(value) {
-        if let Ok(id) = value.parse() {
-            return Ok(id);
-        }
+    if is_id(value)
+        && let Ok(id) = value.parse()
+    {
+        return Ok(id);
     }
     Err(format!("invalid {what} {value:?}"))
 }

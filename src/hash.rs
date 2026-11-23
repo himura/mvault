@@ -63,9 +63,10 @@ impl FromStr for Sha256 {
             return Err(err());
         }
         let mut bytes = [0_u8; 32];
-        for (byte, pair) in bytes.iter_mut().zip(digits.chunks_exact(2)) {
-            let hi = hex_value(pair[0]).ok_or_else(err)?;
-            let lo = hex_value(pair[1]).ok_or_else(err)?;
+        let (pairs, _) = digits.as_chunks::<2>();
+        for (byte, [hi, lo]) in bytes.iter_mut().zip(pairs) {
+            let hi = hex_value(*hi).ok_or_else(err)?;
+            let lo = hex_value(*lo).ok_or_else(err)?;
             *byte = hi << 4 | lo;
         }
         Ok(Self(bytes))
