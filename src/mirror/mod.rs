@@ -21,6 +21,7 @@ use crate::upstream::civitai::Site;
 use crate::upstream::encode_segment;
 use crate::upstream::hf::Hub;
 
+pub mod config;
 pub mod db;
 pub mod exclude;
 
