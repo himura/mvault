@@ -10,15 +10,14 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, write_atomic};
 use crate::hash::Sha256;
+use crate::snapshot::{self, Snapshot, SnapshotFile};
+use crate::source::Source;
 use crate::store::BlobStore;
 use crate::upstream::civitai::Site;
-use crate::upstream::encode_segment;
 use crate::upstream::hf::Hub;
 
 pub mod config;
@@ -183,10 +182,14 @@ impl Mirror {
             revision,
             excludes,
         } = *pull;
-        let source = format!("hf:{host}:{repo}");
+        let origin = Source::HuggingFace {
+            host: host.to_owned(),
+            repo: repo.to_owned(),
+        };
+        let source = origin.to_string();
         let info = hub.repo_info(http, repo, revision)?;
         let commit = info.commit;
-        let dir = Path::new("hf").join(host_dir(host)).join(repo);
+        let dir = snapshot::source_dir(&origin);
         write_atomic(
             &self
                 .public
@@ -235,14 +238,7 @@ impl Mirror {
             });
 
         // Also after a failure: what was fetched before it is worth serving.
-        let snapshots = self.public.join("snapshots").join(&dir);
-        self.export_snapshot(snapshot_id, &pulled, &snapshots)?;
-        for (name, target) in self.db.refs(&pulled.source)? {
-            write_atomic(
-                &snapshots.join("refs").join(encode_segment(&name)),
-                format!("{target}\n").as_bytes(),
-            )?;
-        }
+        self.export(snapshot_id, &origin, &pulled)?;
         result.map(|()| pulled)
     }
 
@@ -269,7 +265,12 @@ impl Mirror {
             version_id,
             selection,
         } = *pull;
-        let source = format!("civitai:{host}:{model_id}");
+        let origin = Source::Civitai {
+            host: host.to_owned(),
+            model_id,
+            version_id: None,
+        };
+        let source = origin.to_string();
         let (version_id, latest_model) = if let Some(version_id) = version_id {
             (version_id, None)
         } else {
@@ -286,9 +287,7 @@ impl Mirror {
             )));
         }
 
-        let dir = Path::new("civitai")
-            .join(host_dir(host))
-            .join(model_id.to_string());
+        let dir = snapshot::source_dir(&origin);
         let metadata = self.public.join("metadata").join(&dir);
         write_atomic(&metadata.join(format!("{version_id}.json")), &version.raw)?;
         let resolved_latest = latest_model.is_some();
@@ -355,14 +354,7 @@ impl Mirror {
                 }
             });
 
-        let snapshots = self.public.join("snapshots").join(&dir);
-        self.export_snapshot(snapshot_id, &pulled, &snapshots)?;
-        for (name, target) in self.db.refs(&pulled.source)? {
-            write_atomic(
-                &snapshots.join(encode_segment(&name)),
-                format!("{target}\n").as_bytes(),
-            )?;
-        }
+        self.export(snapshot_id, &origin, &pulled)?;
         result.map(|()| pulled)
     }
 
@@ -487,30 +479,43 @@ impl Mirror {
         Ok(Outcome::Downloaded)
     }
 
-    /// Writes the snapshot file nodes resolve a model from.
-    fn export_snapshot(&self, snapshot_id: i64, pulled: &Pulled, dir: &Path) -> Result<()> {
+    /// Writes the files nodes resolve a model from: the snapshot, and the
+    /// names that stand for revisions of the source.
+    fn export(&self, snapshot_id: i64, origin: &Source, pulled: &Pulled) -> Result<()> {
         let files = self.db.snapshot_files(snapshot_id)?;
-        let document = SnapshotDocument {
-            schema: 1,
-            source: &pulled.source,
-            revision: &pulled.revision,
+        let document = Snapshot {
+            schema: snapshot::SCHEMA,
+            source: pulled.source.clone(),
+            revision: pulled.revision.clone(),
             files: files
-                .iter()
-                .map(|file| FileDocument {
-                    path: &file.path,
+                .into_iter()
+                .map(|file| SnapshotFile {
+                    path: file.path,
                     file_id: file.file_id,
                     size: file.size,
-                    sha256: file.sha256.map(|digest| digest.to_string()),
-                    kind: "file",
-                    primary: file.primary.then_some(true),
-                    fetched: (!file.fetched).then_some(false),
+                    sha256: file.sha256,
+                    kind: "file".to_owned(),
+                    primary: file.primary,
+                    fetched: file.fetched,
                 })
                 .collect(),
         };
         let mut json = serde_json::to_vec_pretty(&document)
             .map_err(|e| Error::Invalid(format!("cannot write snapshot: {e}")))?;
         json.push(b'\n');
-        write_atomic(&dir.join(format!("{}.json", pulled.revision)), &json)
+        write_atomic(
+            &self
+                .public
+                .join(snapshot::snapshot_path(origin, &pulled.revision)),
+            &json,
+        )?;
+        for (name, target) in self.db.refs(&pulled.source)? {
+            write_atomic(
+                &self.public.join(snapshot::ref_path(origin, &name)),
+                format!("{target}\n").as_bytes(),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -525,38 +530,6 @@ impl Pulled {
             skipped,
         }
     }
-}
-
-/// The snapshot file of the public tree. Optional fields are left out when
-/// they say nothing: `primary` unless true, `fetched` unless false.
-#[derive(Serialize)]
-struct SnapshotDocument<'a> {
-    schema: u32,
-    source: &'a str,
-    revision: &'a str,
-    files: Vec<FileDocument<'a>>,
-}
-
-#[derive(Serialize)]
-struct FileDocument<'a> {
-    path: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sha256: Option<String>,
-    kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    primary: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fetched: Option<bool>,
-}
-
-/// The directory name for a host: a port is separated by `_`, which no host
-/// name contains, because `:` is not allowed in file names everywhere.
-fn host_dir(host: &str) -> String {
-    host.replace(':', "_")
 }
 
 /// The name of the partial file for a download: the digest if it is known,

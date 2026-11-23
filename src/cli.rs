@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 
 use crate::auth::{self, Env};
-use crate::download::Client;
+use crate::download::{Client, Progress};
 use crate::error::{Error, Result};
 use crate::mirror::config::Config;
 use crate::mirror::exclude::Excludes;
@@ -26,6 +26,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Make a directory a workspace
+    Init(node::InitArgs),
+    /// Add a model to the manifest of the workspace
+    Add(node::AddArgs),
+    /// Fetch and place the models of the manifest
+    Sync(node::SyncArgs),
     /// Maintain a mirror (run on the host that stores it)
     Mirror(MirrorArgs),
 }
@@ -78,6 +84,8 @@ pub struct Context<'a> {
     pub base_url: &'a dyn Fn(&str) -> String,
     /// The HTTP client.
     pub http: Client,
+    /// The directory the command is run in.
+    pub cwd: PathBuf,
     /// Where results go.
     pub out: &'a mut dyn Write,
     /// Where progress and warnings go.
@@ -99,6 +107,9 @@ impl std::fmt::Debug for Context<'_> {
 /// Returns the error of the command.
 pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
     match cli.command {
+        Command::Init(args) => node::init(&args, context),
+        Command::Add(args) => node::add(&args, context),
+        Command::Sync(args) => node::sync(&args, context),
         Command::Mirror(mirror) => {
             let root = mirror.root.ok_or_else(|| {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
@@ -265,43 +276,54 @@ impl Reporter<'_> {
     fn write(&mut self, event: Event<'_>) -> std::io::Result<()> {
         match event {
             Event::Started { index, count, path } => {
-                self.label = format!("[{index}/{count}] {path}");
-                self.drawn = None;
-                if self.live {
-                    write!(self.err, "{}", self.label)?;
-                    self.err.flush()?;
-                }
+                self.begin(format!("[{index}/{count}] {path}"))
             }
-            Event::Progress(progress) => {
-                let due = self
-                    .drawn
-                    .is_none_or(|at| at.elapsed() >= Self::REDRAW_EVERY);
-                if self.live && due {
-                    self.drawn = Some(Instant::now());
-                    let total = progress
-                        .total
-                        .map_or_else(String::new, |total| format!(" / {}", human_size(total)));
-                    write!(
-                        self.err,
-                        "\r\x1b[K{}  {}{total}",
-                        self.label,
-                        human_size(progress.done)
-                    )?;
-                    self.err.flush()?;
-                }
-            }
-            Event::Finished(outcome) => {
-                let word = match outcome {
-                    Outcome::Downloaded => "downloaded",
-                    Outcome::Reused => "reused",
-                    Outcome::Present => "already present",
-                };
-                let redraw = if self.live { "\r\x1b[K" } else { "" };
-                writeln!(self.err, "{redraw}{}  {word}", self.label)?;
-            }
-            Event::Warning(message) => writeln!(self.err, "warning: {message}")?,
+            Event::Progress(progress) => self.progress(progress),
+            Event::Finished(outcome) => self.end(match outcome {
+                Outcome::Downloaded => "downloaded",
+                Outcome::Reused => "reused",
+                Outcome::Present => "already present",
+            }),
+            Event::Warning(message) => writeln!(self.err, "warning: {message}"),
+        }
+    }
+
+    /// Starts the line of an item.
+    fn begin(&mut self, label: String) -> std::io::Result<()> {
+        self.label = label;
+        self.drawn = None;
+        if self.live {
+            write!(self.err, "{}", self.label)?;
+            self.err.flush()?;
         }
         Ok(())
+    }
+
+    /// Redraws the line of the current item with how far it has come.
+    fn progress(&mut self, progress: Progress) -> std::io::Result<()> {
+        let due = self
+            .drawn
+            .is_none_or(|at| at.elapsed() >= Self::REDRAW_EVERY);
+        if self.live && due {
+            self.drawn = Some(Instant::now());
+            let total = progress
+                .total
+                .map_or_else(String::new, |total| format!(" / {}", human_size(total)));
+            write!(
+                self.err,
+                "\r\x1b[K{}  {}{total}",
+                self.label,
+                human_size(progress.done)
+            )?;
+            self.err.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Ends the line of the current item with what became of it.
+    fn end(&mut self, word: &str) -> std::io::Result<()> {
+        let redraw = if self.live { "\r\x1b[K" } else { "" };
+        writeln!(self.err, "{redraw}{}  {word}", self.label)
     }
 }
 
@@ -321,5 +343,6 @@ fn human_size(bytes: u64) -> String {
     format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
 }
 
+mod node;
 #[cfg(test)]
 mod tests;

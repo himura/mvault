@@ -62,6 +62,31 @@ impl BlobStore {
         self.blob_path(digest).is_file()
     }
 
+    /// The paths of every stored blob, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directories cannot be listed.
+    pub fn blob_files(&self) -> io::Result<Vec<PathBuf>> {
+        let root = self.blobs.join("sha256");
+        let mut files = Vec::new();
+        let shards = match fs::read_dir(&root) {
+            Ok(shards) => shards,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(files),
+            Err(error) => return Err(with_path(&error, &root)),
+        };
+        for shard in shards {
+            let shard = shard.map_err(|e| with_path(&e, &root))?.path();
+            if !shard.is_dir() {
+                continue;
+            }
+            for blob in fs::read_dir(&shard).map_err(|e| with_path(&e, &shard))? {
+                files.push(blob.map_err(|e| with_path(&e, &shard))?.path());
+            }
+        }
+        Ok(files)
+    }
+
     /// The path for an unfinished file named by `key`, creating the directory
     /// for it. The same key gives the same path, so that an interrupted
     /// download can be continued.
