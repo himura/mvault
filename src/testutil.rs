@@ -186,3 +186,48 @@ fn serve(
     stream.write_all(&response.body[..sent])?;
     stream.flush()
 }
+
+/// A server answering each path with a fixed body. The table can be changed
+/// while the server runs.
+#[derive(Debug)]
+pub(crate) struct Routes {
+    pub(crate) server: TestServer,
+    table: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+}
+
+impl Routes {
+    pub(crate) fn start() -> Self {
+        let table: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>> = Arc::default();
+        let server = TestServer::start({
+            let table = Arc::clone(&table);
+            move |request| match table.lock().unwrap().get(&request.path) {
+                Some(body) => Response::file(request, body),
+                None => Response::status(404),
+            }
+        });
+        Self { server, table }
+    }
+
+    pub(crate) fn route(&self, path: &str, body: &[u8]) {
+        self.table
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), body.to_vec());
+    }
+
+    /// The base URL of the server, without a trailing `/`.
+    pub(crate) fn base(&self) -> String {
+        self.server.url("")
+    }
+}
+
+/// Serves the files below `dir` the way a web server would.
+pub(crate) fn serve_dir(dir: &std::path::Path) -> TestServer {
+    let dir = dir.to_owned();
+    TestServer::start(move |request| {
+        match std::fs::read(dir.join(request.path.trim_start_matches('/'))) {
+            Ok(content) => Response::file(request, &content),
+            Err(_) => Response::status(404),
+        }
+    })
+}

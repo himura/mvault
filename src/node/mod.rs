@@ -6,3 +6,6 @@ pub mod lock;
 pub mod manifest;
 pub mod plan;
 pub mod remote;
+pub mod resolve;
+pub mod sync;
+pub mod workspace;

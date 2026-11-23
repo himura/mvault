@@ -19,6 +19,8 @@ pub struct Placement {
     pub source: String,
     /// The revision of the model, as the lock names it.
     pub revision: Option<String>,
+    /// The commit or version id the model is resolved to.
+    pub resolved: String,
     /// Path of the file in its repository, or its file name.
     pub path: String,
     /// Id of the file, where the upstream gives files ids.
@@ -71,6 +73,7 @@ pub fn plan(manifest: &Manifest, lock: &Lock) -> Result<Vec<Placement>> {
                 dest: dest.clone(),
                 source: locked.source.clone(),
                 revision: locked.revision.clone(),
+                resolved: locked.resolved.clone(),
                 path: file.path.clone(),
                 file_id: file.file_id,
                 size: file.size,
