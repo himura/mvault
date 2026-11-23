@@ -2,6 +2,7 @@
 
 pub mod hash;
 pub mod source;
+pub mod store;
 
 /// Runs the application.
 ///

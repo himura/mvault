@@ -1,0 +1,254 @@
+//! Content-addressed storage of blobs.
+//!
+//! A blob lives at `<blobs>/sha256/<first two hex digits>/<digest>` and is
+//! read-only from the moment it appears there. The mirror and the nodes use
+//! the same layout, so a node can copy a blob by path alone.
+
+use std::fs::{self, File};
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::hash::Sha256;
+
+/// A directory of blobs and the directory where they are written before they
+/// are complete.
+///
+/// Both directories must be on the same filesystem: a finished file enters
+/// the store by a rename.
+#[derive(Debug, Clone)]
+pub struct BlobStore {
+    blobs: PathBuf,
+    tmp: PathBuf,
+}
+
+/// What [`BlobStore::commit`] did with the file it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Committed {
+    /// The file became a new blob.
+    Added,
+    /// A blob with this digest was already stored; the file was removed.
+    AlreadyPresent,
+}
+
+impl BlobStore {
+    /// A store with blobs under `blobs` and unfinished files under `tmp`.
+    ///
+    /// Nothing is created until it is needed.
+    pub fn new(blobs: impl Into<PathBuf>, tmp: impl Into<PathBuf>) -> Self {
+        Self {
+            blobs: blobs.into(),
+            tmp: tmp.into(),
+        }
+    }
+
+    /// The path of the blob with this digest, relative to the blobs directory.
+    ///
+    /// This is also its path below the root of a mirror's public tree.
+    #[must_use]
+    pub fn relative_path(digest: &Sha256) -> PathBuf {
+        let hex = digest.to_string();
+        Path::new("sha256").join(&hex[..2]).join(&hex)
+    }
+
+    /// The path the blob with this digest has, whether or not it is stored.
+    #[must_use]
+    pub fn blob_path(&self, digest: &Sha256) -> PathBuf {
+        self.blobs.join(Self::relative_path(digest))
+    }
+
+    /// Whether the blob with this digest is stored.
+    #[must_use]
+    pub fn contains(&self, digest: &Sha256) -> bool {
+        self.blob_path(digest).is_file()
+    }
+
+    /// The path for an unfinished file named by `key`, creating the directory
+    /// for it. The same key gives the same path, so that an interrupted
+    /// download can be continued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `key` is not a plain file name made of ASCII
+    /// letters, digits, `.`, `-` and `_`, or if the directory cannot be
+    /// created.
+    pub fn partial_path(&self, key: &str) -> io::Result<PathBuf> {
+        let plain = !key.is_empty()
+            && !key.starts_with('.')
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+        if !plain {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid key for a partial file: {key:?}"),
+            ));
+        }
+        fs::create_dir_all(&self.tmp).map_err(|e| with_path(&e, &self.tmp))?;
+        Ok(self.tmp.join(format!("partial-{key}")))
+    }
+
+    /// Moves a completely written file into the store as the blob `digest`.
+    ///
+    /// The caller vouches that `digest` is the digest of the file's content;
+    /// it is expected to have computed it while writing the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be flushed to disk, made
+    /// read-only or renamed into place.
+    pub fn commit(&self, file: &Path, digest: &Sha256) -> io::Result<Committed> {
+        let dest = self.blob_path(digest);
+        if dest.is_file() {
+            fs::remove_file(file).map_err(|e| with_path(&e, file))?;
+            return Ok(Committed::AlreadyPresent);
+        }
+        // Opened for writing: not every platform can flush a read-only handle.
+        File::options()
+            .write(true)
+            .open(file)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| with_path(&e, file))?;
+        make_read_only(file).map_err(|e| with_path(&e, file))?;
+        let dir = dest.parent().unwrap_or(&self.blobs);
+        fs::create_dir_all(dir).map_err(|e| with_path(&e, dir))?;
+        if let Err(e) = fs::rename(file, &dest) {
+            // Where a rename does not replace a read-only file, losing the
+            // race against another writer of the same blob ends up here.
+            if dest.is_file() {
+                fs::remove_file(file).map_err(|e| with_path(&e, file))?;
+                return Ok(Committed::AlreadyPresent);
+            }
+            return Err(with_path(&e, &dest));
+        }
+        sync_dir(dir).map_err(|e| with_path(&e, dir))?;
+        Ok(Committed::Added)
+    }
+}
+
+#[cfg(unix)]
+fn make_read_only(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o444))
+}
+
+#[cfg(not(unix))]
+fn make_read_only(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
+}
+
+/// Makes the rename into `dir` durable.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// The same error, naming the path it is about.
+fn with_path(error: &io::Error, path: &Path) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn store(dir: &Path) -> BlobStore {
+        BlobStore::new(dir.join("blobs"), dir.join("tmp"))
+    }
+
+    fn write_partial(store: &BlobStore, key: &str, content: &[u8]) -> PathBuf {
+        let path = store.partial_path(key).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn blob_paths_are_sharded_by_the_first_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        assert_eq!(
+            BlobStore::relative_path(&digest),
+            Path::new("sha256").join("ba").join(ABC)
+        );
+        assert_eq!(
+            store.blob_path(&digest),
+            dir.path().join("blobs").join("sha256").join("ba").join(ABC)
+        );
+    }
+
+    #[test]
+    fn commit_moves_the_file_and_makes_it_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        assert!(!store.contains(&digest));
+
+        let partial = write_partial(&store, "one", b"abc");
+        assert_eq!(store.commit(&partial, &digest).unwrap(), Committed::Added);
+
+        assert!(!partial.exists());
+        assert!(store.contains(&digest));
+        let blob = store.blob_path(&digest);
+        assert_eq!(fs::read(&blob).unwrap(), b"abc");
+        assert!(fs::metadata(&blob).unwrap().permissions().readonly());
+    }
+
+    #[test]
+    fn commit_of_a_stored_digest_drops_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        store
+            .commit(&write_partial(&store, "one", b"abc"), &digest)
+            .unwrap();
+
+        let second = write_partial(&store, "two", b"abc");
+        assert_eq!(
+            store.commit(&second, &digest).unwrap(),
+            Committed::AlreadyPresent
+        );
+        assert!(!second.exists());
+        assert_eq!(fs::read(store.blob_path(&digest)).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn commit_reports_the_path_of_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let missing = dir.path().join("tmp").join("partial-missing");
+        let err = store.commit(&missing, &Sha256::of(b"abc")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("partial-missing"), "{err}");
+    }
+
+    #[test]
+    fn partial_paths_are_stable_and_inside_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let path = store.partial_path(ABC).unwrap();
+        assert_eq!(path, dir.path().join("tmp").join(format!("partial-{ABC}")));
+        assert_eq!(store.partial_path(ABC).unwrap(), path);
+        assert!(dir.path().join("tmp").is_dir());
+    }
+
+    #[test]
+    fn partial_keys_must_be_plain_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        for key in ["", ".", "..", ".hidden", "a/b", "a\\b", "a b", "é"] {
+            let err = store.partial_path(key).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{key:?}");
+        }
+    }
+}
