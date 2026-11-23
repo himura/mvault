@@ -33,6 +33,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         env: &|name| std::env::var(name).ok(),
         base_url: &|host| format!("https://{host}"),
         http: download::Client::default(),
+        cwd: std::env::current_dir()?,
         out: &mut std::io::stdout(),
         err: &mut err,
         live,

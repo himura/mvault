@@ -90,7 +90,14 @@ struct Run {
 }
 
 fn run(upstream: &Upstream, root: &Path, env: &[(&str, &str)], args: &[&str]) -> Run {
-    let mut command = vec!["mvault", "mirror", "--root", root.to_str().unwrap()];
+    let mut command = vec!["mirror", "--root", root.to_str().unwrap()];
+    command.extend(args);
+    run_in(upstream, &std::env::temp_dir(), env, &command)
+}
+
+/// Runs `mvault <args>` in the directory `cwd`.
+fn run_in(upstream: &Upstream, cwd: &Path, env: &[(&str, &str)], args: &[&str]) -> Run {
+    let mut command = vec!["mvault"];
     command.extend(args);
     let cli = Cli::try_parse_from(command).unwrap();
     let env: HashMap<String, String> = env
@@ -112,6 +119,7 @@ fn run(upstream: &Upstream, root: &Path, env: &[(&str, &str)], args: &[&str]) ->
                 max_failures: 1,
                 ..RetryPolicy::default()
             }),
+            cwd: cwd.to_owned(),
             out: &mut out,
             err: &mut err,
             live: false,
@@ -452,6 +460,7 @@ fn the_mirror_root_is_required() {
             env: &|_| None,
             base_url: &|_| upstream.server.url(""),
             http: Client::default(),
+            cwd: std::env::temp_dir(),
             out: &mut out,
             err: &mut err,
             live: false,
@@ -510,4 +519,235 @@ fn sizes_are_shown_with_binary_units() {
     ] {
         assert_eq!(human_size(bytes), text);
     }
+}
+
+/// A mirror that pulled the repository of the test upstream without
+/// `assets/`, and an initialized workspace that uses it.
+fn mirror_and_workspace(upstream: &Upstream, dir: &Path) -> std::path::PathBuf {
+    let mirror = dir.join("mirror");
+    run(
+        upstream,
+        &mirror,
+        &[],
+        &[
+            "pull",
+            "hf",
+            "example-org/example-model",
+            "--exclude",
+            "assets",
+        ],
+    )
+    .result
+    .unwrap();
+    let workspace = dir.join("mlenv");
+    let public = mirror.join("public");
+    let init = run_in(
+        upstream,
+        dir,
+        &[],
+        &["init", "mlenv", "--mirror", public.to_str().unwrap()],
+    );
+    init.result.unwrap();
+    assert_eq!(init.out.lines().count(), 3, "{}", init.out);
+    workspace
+}
+
+#[test]
+fn a_model_goes_from_the_upstream_through_the_mirror_into_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let requests = upstream.requests().len();
+
+    let added = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &[
+            "add",
+            "https://huggingface.co/example-org/example-model/blob/main/config.json",
+            "--dest",
+            "models/x/",
+        ],
+    );
+    added.result.unwrap();
+    assert_eq!(
+        added.out,
+        format!(
+            "added to mvault.toml (resolved to {COMMIT}):\n\n[[model]]\nsource = \"hf:example-org/example-model\"\n\
+             files = [\n  {{ path = \"config.json\", dest = \"models/x/\" }},\n]\n\n"
+        )
+    );
+    assert!(!workspace.join("models").exists());
+
+    // From a directory below the workspace, as one would while working there.
+    fs::create_dir_all(workspace.join("models")).unwrap();
+    let synced = run_in(&upstream, &workspace.join("models"), &[], &["sync"]);
+    synced.result.unwrap();
+    assert_eq!(
+        synced.out,
+        "0 resolved, 1 fetched, 1 linked, 0 unchanged, 0 pruned (done)\n"
+    );
+    assert_eq!(synced.err, "[1/1] models/x/config.json  fetched\n");
+    assert_eq!(
+        fs::read(workspace.join("models/x/config.json")).unwrap(),
+        b"{}"
+    );
+
+    let again = run_in(&upstream, &workspace, &[], &["sync", "-n"]);
+    again.result.unwrap();
+    assert_eq!(
+        again.out,
+        "0 resolved, 0 fetched, 0 linked, 1 unchanged, 0 pruned (would be done)\n"
+    );
+
+    // The mirror answered everything the node asked.
+    assert_eq!(upstream.requests().len(), requests);
+}
+
+#[test]
+fn sync_reports_conflicts_and_a_missing_file_as_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let add = |dest: &str, path: &str| {
+        run_in(
+            &upstream,
+            &workspace,
+            &[],
+            &[
+                "add",
+                "hf:example-org/example-model",
+                "--dest",
+                dest,
+                "--path",
+                path,
+            ],
+        )
+    };
+
+    add("models/x/", "config.json").result.unwrap();
+    fs::create_dir_all(workspace.join("models/x")).unwrap();
+    fs::write(workspace.join("models/x/config.json"), b"mine").unwrap();
+    let conflict = run_in(&upstream, &workspace, &[], &["sync"]);
+    assert!(
+        conflict
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("1 destination(s) are taken"),
+    );
+    assert_eq!(
+        conflict.err,
+        "[1/1] models/x/config.json  fetched\n\
+         conflict: models/x/config.json exists and is not managed by mvault (--force replaces it)\n"
+    );
+    run_in(&upstream, &workspace, &[], &["sync", "--force"])
+        .result
+        .unwrap();
+    assert_eq!(
+        fs::read(workspace.join("models/x/config.json")).unwrap(),
+        b"{}"
+    );
+
+    add("models/assets/", "assets/*").result.unwrap();
+    let missing = run_in(&upstream, &workspace, &[], &["sync"]);
+    let error = missing.result.unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "on the mirror host run: mvault mirror pull hf:huggingface.co:example-org/example-model"
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn without_a_mirror_the_upstream_is_used_with_the_token_of_its_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let home = dir.path().join("home");
+    fs::create_dir_all(home.join(".config/mvault")).unwrap();
+    fs::write(
+        home.join(".config/mvault/config.toml"),
+        "allow_official = true\n[civitai]\ndefault_host = \"example.com\"\n",
+    )
+    .unwrap();
+    let env = [
+        ("HOME", home.to_str().unwrap()),
+        ("HF_TOKEN", "hub-secret"),
+        ("CIVITAI_TOKEN", "site-secret"),
+    ];
+    let workspace = dir.path().join("mlenv");
+    run_in(&upstream, dir.path(), &env, &["init", "mlenv"])
+        .result
+        .unwrap();
+
+    for (source, dest) in [
+        ("hf:example-org/example-model", "models/x/"),
+        ("hf:hub.example.com:example-org/example-model", "models/y/"),
+        ("civitai:12345", "models/loras/"),
+        ("https://other.example.net/models/12345", "models/other/"),
+    ] {
+        run_in(
+            &upstream,
+            &workspace,
+            &env,
+            &["add", source, "--dest", dest],
+        )
+        .result
+        .unwrap();
+    }
+    let synced = run_in(&upstream, &workspace, &env, &["sync"]);
+    synced.result.unwrap();
+    assert_eq!(
+        synced.out,
+        "0 resolved, 5 fetched, 6 linked, 0 unchanged, 0 pruned (done)\n"
+    );
+    assert_eq!(
+        fs::read(workspace.join("models/loras/model.safetensors")).unwrap(),
+        b"weights"
+    );
+    assert_eq!(
+        fs::read(workspace.join("models/y/assets/sample.mp4")).unwrap(),
+        b"sample"
+    );
+
+    // Each token went to its own host and nowhere else. The test server
+    // stands for all hosts, so the requests are told apart by their order:
+    // one resolution per add, then the downloads.
+    let sent = authorizations(&upstream);
+    let hosts = synced.hosts;
+    assert_eq!(sent[0].as_deref(), Some("Bearer hub-secret"));
+    assert_eq!(sent[1], None);
+    assert_eq!(sent[2].as_deref(), Some("Bearer site-secret"));
+    assert_eq!(sent[3].as_deref(), Some("Bearer site-secret"));
+    assert_eq!(sent[4], None);
+    assert_eq!(sent[5], None);
+    assert!(hosts.contains(&"huggingface.co".to_owned()));
+    assert!(hosts.contains(&"example.com".to_owned()));
+}
+
+#[test]
+fn node_commands_need_a_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    for args in [
+        vec!["sync"],
+        vec!["add", "hf:example-org/example-model", "--dest", "x/"],
+    ] {
+        let run = run_in(&upstream, dir.path(), &[], &args);
+        let error = run.result.unwrap_err().to_string();
+        assert!(error.contains("mvault init creates one"), "{error}");
+    }
+
+    let first = run_in(&upstream, dir.path(), &[], &["init"]);
+    first.result.unwrap();
+    assert!(first.out.contains("created"), "{}", first.out);
+    let second = run_in(&upstream, dir.path(), &[], &["init"]);
+    second.result.unwrap();
+    assert!(
+        second.out.contains("is already a workspace"),
+        "{}",
+        second.out
+    );
 }

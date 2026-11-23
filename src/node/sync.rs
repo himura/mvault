@@ -102,38 +102,8 @@ pub fn sync(
     let manifest = Manifest::load(&workspace.root, &workspace.defaults())?;
     let lock_path = workspace.lock_path();
     let mut lock = Lock::load(&lock_path)?;
-    let mut lock_changed = false;
-
-    for model in unresolved(&manifest, &lock) {
-        if options.locked {
-            return Err(Error::Invalid(format!(
-                "{} is not in the lock file, and --locked forbids resolving it",
-                model.source
-            )));
-        }
-        let locked = resolve(model, access)?;
-        on_event(Event::Resolved {
-            source: &locked.source,
-            resolved: &locked.resolved,
-        });
-        lock.insert(locked);
-        report.resolved += 1;
-        lock_changed = true;
-    }
-
-    // Digests the upstream did not announce may be known to a mirror by now.
-    let without_digest: BTreeSet<(String, Option<String>)> = plan(&manifest, &lock)?
-        .into_iter()
-        .filter(|placement| placement.sha256.is_none())
-        .map(|placement| (placement.source, placement.revision))
-        .collect();
-    for (source, revision) in &without_digest {
-        if let Some(locked) = lock.get_mut(source, revision.as_deref())
-            && fill_digests(locked, access)?
-        {
-            lock_changed = true;
-        }
-    }
+    let lock_changed =
+        bring_up_to_date(&manifest, &mut lock, access, options, &mut report, on_event)?;
     if lock_changed && !options.dry_run {
         lock.save(&lock_path)?;
     }
@@ -151,7 +121,12 @@ pub fn sync(
         .collect();
     report.fetched = to_fetch.len();
     if !options.dry_run {
+        report.fetched = 0;
         for (position, index) in to_fetch.iter().enumerate() {
+            if placements[*index].sha256.is_some() && is_stored(workspace, &placements[*index]) {
+                // The same file, placed twice, was fetched for the other place.
+                continue;
+            }
             on_event(Event::Fetching {
                 index: position + 1,
                 count: to_fetch.len(),
@@ -159,10 +134,16 @@ pub fn sync(
             });
             let digest = fetch(workspace, access, &placements[*index], on_event)?;
             on_event(Event::Fetched);
+            report.fetched += 1;
             if placements[*index].sha256.is_none() {
                 record_digest(&mut lock, &placements[*index], digest);
                 lock.save(&lock_path)?;
-                placements[*index].sha256 = Some(digest);
+                let fetched = placements[*index].clone();
+                for placement in &mut placements {
+                    if same_file(placement, &fetched) {
+                        placement.sha256 = Some(digest);
+                    }
+                }
             }
         }
     }
@@ -200,6 +181,61 @@ pub fn sync(
         )?;
     }
     Ok(report)
+}
+
+/// Resolves the models the lock lacks and fills in digests a mirror knows
+/// by now. Returns whether the lock changed.
+fn bring_up_to_date(
+    manifest: &Manifest,
+    lock: &mut Lock,
+    access: &Access<'_>,
+    options: Options,
+    report: &mut Report,
+    on_event: &mut dyn FnMut(Event<'_>),
+) -> Result<bool> {
+    let mut changed = false;
+    for model in unresolved(manifest, lock) {
+        if options.locked {
+            return Err(Error::Invalid(format!(
+                "{} is not in the lock file, and --locked forbids resolving it",
+                model.source
+            )));
+        }
+        let locked = resolve(model, access)?;
+        on_event(Event::Resolved {
+            source: &locked.source,
+            resolved: &locked.resolved,
+        });
+        lock.insert(locked);
+        report.resolved += 1;
+        changed = true;
+    }
+
+    // Digests the upstream did not announce may be known to a mirror by now.
+    let without_digest: BTreeSet<(String, Option<String>)> = plan(manifest, lock)?
+        .into_iter()
+        .filter(|placement| placement.sha256.is_none())
+        .map(|placement| (placement.source, placement.revision))
+        .collect();
+    for (source, revision) in &without_digest {
+        if let Some(locked) = lock.get_mut(source, revision.as_deref())
+            && fill_digests(locked, access)?
+        {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn is_stored(workspace: &Workspace, placement: &Placement) -> bool {
+    placement
+        .sha256
+        .is_some_and(|digest| workspace.store.contains(&digest))
+}
+
+/// Whether two placements are of the same file of the same model.
+fn same_file(a: &Placement, b: &Placement) -> bool {
+    (&a.source, &a.revision, &a.path, a.file_id) == (&b.source, &b.revision, &b.path, b.file_id)
 }
 
 /// Removes managed files that the manifest no longer places, from the

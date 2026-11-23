@@ -553,6 +553,26 @@ fn the_same_content_is_fetched_once_and_placed_twice() {
 }
 
 #[test]
+fn a_file_without_a_digest_is_fetched_once_for_two_places() {
+    let world = World::new();
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [\n\
+         {{ path = \"config.json\", dest = \"a/\" }},\n{{ path = \"config.json\", dest = \"b/copy.json\" }},\n]\n"
+    ));
+    world.settings("allow_official = true\n");
+    let before = world.upstream_requests();
+
+    let (result, _, _) = world.sync_with(&[], Options::default());
+
+    let report = result.unwrap();
+    assert_eq!((report.fetched, report.linked), (1, 2));
+    assert_eq!(world.read("a/config.json"), b"{}");
+    assert_eq!(world.read("b/copy.json"), b"{}");
+    // One request to resolve, one to download.
+    assert_eq!(world.upstream_requests(), before + 2);
+}
+
+#[test]
 fn a_mirror_that_fails_is_passed_over_with_a_warning() {
     let world = World::new();
     world.manifest(REPO_ENTRY);
