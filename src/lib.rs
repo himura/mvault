@@ -1,5 +1,13 @@
 //! Core library for the `mvault` command-line tool.
 
+pub mod download;
+pub mod hash;
+pub mod source;
+pub mod store;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod testutil;
+
 /// Runs the application.
 ///
 /// # Errors
