@@ -6,13 +6,15 @@
 //! <root>/private/   mvault.db, tmp/                 (never served)
 //! ```
 
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
-use crate::fsutil::{io_error, write_atomic};
+use crate::fsutil::{io_error, lock_file, write_atomic};
+use crate::gc::{PARTIAL_MAX_AGE, clean_tmp};
 use crate::hash::Sha256;
 use crate::snapshot::{self, Snapshot, SnapshotFile};
 use crate::source::Source;
@@ -92,6 +94,33 @@ pub struct Pulled {
     pub present: usize,
     /// Files of the snapshot that this pull left out.
     pub skipped: usize,
+}
+
+/// A blob the database lists whose file is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingBlob {
+    /// Digest of the blob.
+    pub sha256: Sha256,
+    /// The snapshots that had it as the content of a file, each as
+    /// `<source>@<revision>`. Pulling them again restores the blob.
+    pub snapshots: Vec<String>,
+}
+
+/// What a garbage collection removed, or would remove, and what it found
+/// out of order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// Blobs no snapshot uses, with their sizes.
+    pub blobs: Vec<(Sha256, u64)>,
+    /// Partial files of downloads given up long ago.
+    pub partials: Vec<PathBuf>,
+    /// Blobs the database listed whose files are gone. Unless this was a
+    /// dry run, they are forgotten and the files that had them as content
+    /// are no longer marked as fetched.
+    pub missing: Vec<MissingBlob>,
+    /// Files among the blobs that the database does not list. They are
+    /// left alone: a pull that is storing a blob right now looks like this.
+    pub untracked: Vec<PathBuf>,
 }
 
 /// What to pull from a hub.
@@ -415,13 +444,7 @@ impl Mirror {
         // One process at a time works on a partial file. The lock goes away
         // with the process, so a crash leaves nothing to clean up by hand.
         let lock_path = partial.with_extension("lock");
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(io_error(&lock_path))?;
-        lock.lock().map_err(io_error(&lock_path))?;
+        let _guard = lock_file(&lock_path)?;
         if let Some(digest) = &announced
             && self.db.use_stored_blob(snapshot_id, file.key(), digest)?
         {
@@ -477,6 +500,77 @@ impl Mirror {
             || prepared.commit().map(|_| ()).map_err(Error::Store),
         )?;
         Ok(Outcome::Downloaded)
+    }
+
+    /// Removes the blobs no snapshot uses that have been stored for at
+    /// least `min_age`, and what downloads left behind. With `dry_run`,
+    /// only reports.
+    ///
+    /// A blob is kept for `min_age` because a pull stores it before the
+    /// snapshot that uses it is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database or the files cannot be read or
+    /// changed.
+    pub fn gc(&mut self, min_age: Duration, dry_run: bool) -> Result<Collected> {
+        let cutoff = db::now().saturating_sub(min_age.as_secs());
+        let store = &self.store;
+        let blobs = if dry_run {
+            self.db.unused_blobs(cutoff)?
+        } else {
+            self.db
+                .remove_unused_blobs(cutoff, |digest| store.remove(digest).map_err(Error::Store))?
+        };
+        let partials = clean_tmp(store.tmp_dir(), PARTIAL_MAX_AGE, dry_run)?;
+
+        // The database and the directory should agree on what is stored.
+        // A blob the database lists without a file is forgotten, so that
+        // a pull downloads it again instead of taking it as stored.
+        let listed = self.db.blob_digests()?;
+        let mut missing = Vec::new();
+        for digest in &listed {
+            // In a dry run the unused blobs are still listed; whether
+            // their files exist no longer matters.
+            let unused = blobs.iter().any(|(blob, _)| blob == digest);
+            if !unused && !store.contains(digest) {
+                let snapshots = self
+                    .db
+                    .blob_snapshots(digest)?
+                    .into_iter()
+                    .map(|(source, revision)| format!("{source}@{revision}"))
+                    .collect();
+                missing.push(MissingBlob {
+                    sha256: *digest,
+                    snapshots,
+                });
+            }
+        }
+        if !dry_run {
+            let gone: Vec<Sha256> = missing.iter().map(|blob| blob.sha256).collect();
+            let forgotten = self
+                .db
+                .forget_blobs(&gone, |digest| !store.contains(digest))?;
+            // A pull stored the blob again in the meantime.
+            missing.retain(|blob| forgotten.contains(&blob.sha256));
+        }
+        let known = self.db.blob_digests()?;
+        let untracked = store
+            .blob_files()
+            .map_err(Error::Store)?
+            .into_iter()
+            .filter(|path| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.parse()
+                    .map_or(true, |digest: Sha256| known.binary_search(&digest).is_err())
+            })
+            .collect();
+        Ok(Collected {
+            blobs,
+            partials,
+            missing,
+            untracked,
+        })
     }
 
     /// Writes the files nodes resolve a model from: the snapshot, and the

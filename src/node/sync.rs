@@ -6,10 +6,11 @@
 //! other file belongs to the user and is left alone.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::gc::gc_lock;
 use super::lock::Lock;
 use super::manifest::{Manifest, STATE_DIR};
 use super::plan::{Placement, plan, unresolved};
@@ -17,7 +18,7 @@ use super::resolve::{Access, fill_digests, parse_source, resolve};
 use super::workspace::Workspace;
 use crate::download::{Downloaded, Progress, Request};
 use crate::error::{Error, Result};
-use crate::fsutil::io_error;
+use crate::fsutil::{io_error, lock_file};
 use crate::hash::Sha256;
 use crate::source::Source;
 use crate::store::BlobStore;
@@ -98,6 +99,13 @@ pub fn sync(
     options: Options,
     on_event: &mut dyn FnMut(Event<'_>),
 ) -> Result<Report> {
+    // Held to the end: a garbage collection must not take a blob away
+    // between its fetch and its first link.
+    let _in_use = if options.dry_run {
+        None
+    } else {
+        Some(gc_lock(&workspace.store, false)?)
+    };
     let mut report = Report::default();
     let manifest = Manifest::load(&workspace.root, &workspace.defaults())?;
     let lock_path = workspace.lock_path();
@@ -309,13 +317,7 @@ fn fetch(
     let partial = store.partial_path(&key).map_err(Error::Store)?;
     // One process at a time works on a partial file; another sync waits.
     let lock_path = partial.with_extension("lock");
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(io_error(&lock_path))?;
-    lock.lock().map_err(io_error(&lock_path))?;
+    let _guard = lock_file(&lock_path)?;
 
     if let Some(digest) = placement.sha256 {
         if store.contains(&digest) {
