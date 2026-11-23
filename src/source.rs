@@ -11,22 +11,32 @@ use percent_encoding::percent_decode_str;
 /// The host assumed for a `hf:` source that does not name one.
 pub const DEFAULT_HF_HOST: &str = "huggingface.co";
 
+const HTTPS_PORT: u16 = 443;
+const HTTP_PORT: u16 = 80;
+
 /// The origin of a model: a repository or a model version on an upstream host.
 ///
 /// Every host is its own namespace; two hosts never share an identity, even if
 /// they happen to serve the same ids.
+///
+/// A host has exactly one spelling, so that it can serve as a key and as a
+/// directory name: lowercase, no trailing dot, and the port in decimal without
+/// leading zeros. The port is left out if it is 443, and a URL may also leave
+/// out (or spell out) the default port of its own scheme.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Source {
     /// A model repository on a Hugging Face compatible hub.
     HuggingFace {
-        /// Host of the hub, lowercase, with the port if it is not the default.
+        /// Host of the hub, lowercase, with the port if it is not the default
+        /// one (see [`Source`] on what counts as the default).
         host: String,
         /// Repository id: `<org>/<repo>`, or `<repo>` alone.
         repo: String,
     },
     /// A model on a Civitai compatible site.
     Civitai {
-        /// Host of the site, lowercase, with the port if it is not the default.
+        /// Host of the site, lowercase, with the port if it is not the default
+        /// one (see [`Source`] on what counts as the default).
         host: String,
         /// Id of the model.
         model_id: u64,
@@ -98,8 +108,8 @@ impl Reference {
             parse_hf(rest).map(Self::from)
         } else if let Some(rest) = input.strip_prefix("civitai:") {
             parse_civitai(rest, defaults).map(Self::from)
-        } else if let Some(rest) = strip_scheme(input) {
-            parse_url(rest)
+        } else if let Some((default_port, rest)) = strip_scheme(input) {
+            parse_url(rest, default_port)
         } else {
             Err("expected hf:<org>/<repo>, civitai:<host>:<modelId>@<versionId> or a URL".into())
         };
@@ -123,7 +133,7 @@ impl From<Source> for Reference {
 
 fn parse_hf(rest: &str) -> Result<Source, Reason> {
     let (host, repo) = match rest.rsplit_once(':') {
-        Some((host, repo)) => (normalize_host(host)?, repo),
+        Some((host, repo)) => (normalize_host(host, HTTPS_PORT)?, repo),
         None => (DEFAULT_HF_HOST.to_owned(), rest),
     };
     let segments: Vec<&str> = repo.split('/').collect();
@@ -141,9 +151,9 @@ fn parse_hf(rest: &str) -> Result<Source, Reason> {
 
 fn parse_civitai(rest: &str, defaults: &Defaults) -> Result<Source, Reason> {
     let (host, ids) = match rest.rsplit_once(':') {
-        Some((host, ids)) => (normalize_host(host)?, ids),
+        Some((host, ids)) => (normalize_host(host, HTTPS_PORT)?, ids),
         None => match &defaults.civitai_host {
-            Some(host) => (normalize_host(host)?, rest),
+            Some(host) => (normalize_host(host, HTTPS_PORT)?, rest),
             None => return Err("no host given and no default civitai host is configured".into()),
         },
     };
@@ -161,17 +171,24 @@ fn parse_civitai(rest: &str, defaults: &Defaults) -> Result<Source, Reason> {
     })
 }
 
-/// The part of an http(s) URL after `://`, if `input` is one.
-fn strip_scheme(input: &str) -> Option<&str> {
+/// The default port of the scheme and the part after `://`, if `input` is an
+/// http(s) URL.
+fn strip_scheme(input: &str) -> Option<(u16, &str)> {
     let (scheme, rest) = input.split_once("://")?;
-    (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")).then_some(rest)
+    if scheme.eq_ignore_ascii_case("https") {
+        Some((HTTPS_PORT, rest))
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Some((HTTP_PORT, rest))
+    } else {
+        None
+    }
 }
 
-fn parse_url(rest: &str) -> Result<Reference, Reason> {
+fn parse_url(rest: &str, default_port: u16) -> Result<Reference, Reason> {
     let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = normalize_host(authority)?;
+    let host = normalize_host(authority, default_port)?;
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -265,9 +282,13 @@ fn decode_segment(segment: &str) -> Result<String, Reason> {
     Ok(decoded.into_owned())
 }
 
-/// Lowercases a `host[:port]` and checks that it only has characters that are
-/// safe in a directory name.
-fn normalize_host(host: &str) -> Result<String, Reason> {
+/// Reduces a `host[:port]` to its one spelling (see [`Source`]) and checks
+/// that it only has characters that are safe in a directory name.
+///
+/// `default_port` is the default port of the scheme the host was written
+/// with; it is dropped like 443 is.
+fn normalize_host(host: &str, default_port: u16) -> Result<String, Reason> {
+    let invalid = || format!("invalid host {host:?}");
     let lower = host.to_ascii_lowercase();
     let (name, port) = match lower.split_once(':') {
         Some((name, port)) => (name, Some(port)),
@@ -275,16 +296,23 @@ fn normalize_host(host: &str) -> Result<String, Reason> {
     };
     let name_ok = !name.is_empty()
         && !name.starts_with(['.', '-'])
+        && !name.ends_with('.')
         && !name.contains("..")
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
-    let port_ok =
-        port.is_none_or(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
-    if name_ok && port_ok {
-        Ok(lower)
-    } else {
-        Err(format!("invalid host {host:?}"))
+    if !name_ok {
+        return Err(invalid());
+    }
+    let port = match port {
+        // `parse` alone would also take a sign.
+        Some(port) if is_id(port) => Some(port.parse::<u16>().map_err(|_| invalid())?),
+        Some(_) => return Err(invalid()),
+        None => None,
+    };
+    match port {
+        Some(port) if port != HTTPS_PORT && port != default_port => Ok(format!("{name}:{port}")),
+        _ => Ok(name.to_owned()),
     }
 }
 
@@ -466,8 +494,68 @@ mod tests {
 
     #[test]
     fn model_page_shape_on_the_default_hub_is_a_repository() {
-        let parsed = parse("https://huggingface.co/models/12345").unwrap();
-        assert_eq!(parsed.source, hf("huggingface.co", "models/12345"));
+        for input in [
+            "https://huggingface.co/models/12345",
+            "https://huggingface.co:443/models/12345",
+        ] {
+            let parsed = parse(input).unwrap();
+            assert_eq!(
+                parsed.source,
+                hf("huggingface.co", "models/12345"),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_has_one_spelling() {
+        for (input, host) in [
+            (
+                "https://hub.example.com:443/example-model",
+                "hub.example.com",
+            ),
+            (
+                "https://hub.example.com:0443/example-model",
+                "hub.example.com",
+            ),
+            ("http://hub.example.com:80/example-model", "hub.example.com"),
+            (
+                "http://hub.example.com:443/example-model",
+                "hub.example.com",
+            ),
+            (
+                "https://hub.example.com:80/example-model",
+                "hub.example.com:80",
+            ),
+            (
+                "https://hub.example.com:08080/example-model",
+                "hub.example.com:8080",
+            ),
+            ("hf:hub.example.com:443:example-model", "hub.example.com"),
+            ("hf:hub.example.com:80:example-model", "hub.example.com:80"),
+            (
+                "hf:hub.example.com:0080:example-model",
+                "hub.example.com:80",
+            ),
+        ] {
+            assert_eq!(
+                parse(input).unwrap().source,
+                hf(host, "example-model"),
+                "{input:?}"
+            );
+        }
+
+        assert_eq!(
+            parse("civitai:example.com:443:12345").unwrap().source,
+            civitai("example.com", 12345, None)
+        );
+        let defaults = Defaults {
+            civitai_host: Some("example.com:443".into()),
+        };
+        assert_eq!(
+            Reference::parse("civitai:12345", &defaults).unwrap().source,
+            civitai("example.com", 12345, None)
+        );
     }
 
     #[test]
@@ -483,6 +571,11 @@ mod tests {
             "hf:example-org/has space",
             "hf:bad host:example-org/example-model",
             "hf:example.com:port:example-org/example-model",
+            "hf:example.com.:example-org/example-model",
+            "hf:example.com:65536:example-org/example-model",
+            "hf:example.com:+80:example-org/example-model",
+            "https://example.com./example-org/example-model",
+            "https://example.com:/example-org/example-model",
             "civitai:example.com:",
             "civitai:example.com:abc",
             "civitai:example.com:1@",
