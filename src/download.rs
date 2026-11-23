@@ -16,6 +16,9 @@ use crate::hash::{Hasher, Sha256};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
+/// The largest body [`Client::get`] reads into memory.
+pub const MAX_BODY_SIZE: u64 = 64 * 1024 * 1024;
+
 /// How often and how patiently a failed request is repeated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
@@ -292,6 +295,88 @@ impl Client {
         })
     }
 
+    /// Fetches a small resource, such as an API response, into memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server refuses the request, if the request
+    /// keeps failing, or if the body is larger than [`MAX_BODY_SIZE`].
+    pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, DownloadError> {
+        let mut failures = 0;
+        loop {
+            let reason = match self.get_once(url, headers) {
+                Ok(body) => return Ok(body),
+                Err(Failure::Fatal(error)) => return Err(error),
+                Err(Failure::Retry(reason)) => reason,
+                Err(Failure::Restart) => "unexpected HTTP status 416".to_owned(),
+            };
+            failures += 1;
+            if failures >= self.retry.max_failures {
+                return Err(DownloadError::Failed {
+                    url: url.to_owned(),
+                    reason,
+                });
+            }
+            std::thread::sleep(self.retry.delay(failures));
+        }
+    }
+
+    fn get_once(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Failure> {
+        let response = self.send(url, headers, None)?;
+        let status = response.status().as_u16();
+        match status {
+            200 => {}
+            408 | 429 | 500..=599 => return Err(Failure::Retry(format!("HTTP status {status}"))),
+            _ => {
+                return Err(Failure::Fatal(DownloadError::Status {
+                    url: url.to_owned(),
+                    status,
+                }));
+            }
+        }
+        response
+            .into_body()
+            .into_with_config()
+            .limit(MAX_BODY_SIZE)
+            .read_to_vec()
+            .map_err(|error| match error {
+                ureq::Error::BodyExceedsLimit(_) => Failure::Fatal(DownloadError::Failed {
+                    url: url.to_owned(),
+                    reason: error.to_string(),
+                }),
+                _ => Failure::Retry(error.to_string()),
+            })
+    }
+
+    /// Sends a GET request, asking for the bytes from `range_from` on if it
+    /// is given.
+    fn send(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        range_from: Option<u64>,
+    ) -> Result<ureq::http::Response<ureq::Body>, Failure> {
+        // Compressed transfer would make byte ranges meaningless.
+        let mut call = self.agent.get(url).header("Accept-Encoding", "identity");
+        for (name, value) in headers {
+            call = call.header(*name, *value);
+        }
+        if let Some(start) = range_from {
+            call = call.header("Range", format!("bytes={start}-"));
+        }
+        call.call().map_err(|error| match error {
+            ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::HostNotFound
+            | ureq::Error::Protocol(_) => Failure::Retry(error.to_string()),
+            _ => Failure::Fatal(DownloadError::Failed {
+                url: url.to_owned(),
+                reason: error.to_string(),
+            }),
+        })
+    }
+
     /// One request for whatever `target` is missing. Returns when the server
     /// has sent everything it announced.
     fn attempt(
@@ -300,28 +385,11 @@ impl Client {
         target: &mut Target<'_>,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<(), Failure> {
-        // Compressed transfer would make byte ranges meaningless.
-        let mut call = self
-            .agent
-            .get(request.url)
-            .header("Accept-Encoding", "identity");
-        for (name, value) in request.headers {
-            call = call.header(*name, *value);
-        }
-        if target.len > 0 {
-            call = call.header("Range", format!("bytes={}-", target.len));
-        }
-        let response = call.call().map_err(|error| match error {
-            ureq::Error::Io(_)
-            | ureq::Error::Timeout(_)
-            | ureq::Error::ConnectionFailed
-            | ureq::Error::HostNotFound
-            | ureq::Error::Protocol(_) => Failure::Retry(error.to_string()),
-            _ => Failure::Fatal(DownloadError::Failed {
-                url: request.url.to_owned(),
-                reason: error.to_string(),
-            }),
-        })?;
+        let response = self.send(
+            request.url,
+            request.headers,
+            (target.len > 0).then_some(target.len),
+        )?;
 
         let status = response.status().as_u16();
         match status {
@@ -696,6 +764,54 @@ mod tests {
 
         assert!(matches!(error, DownloadError::Failed { .. }), "{error}");
         assert_eq!(fs::read(&dest).unwrap(), b"beginning");
+    }
+
+    #[test]
+    fn get_returns_the_body_and_sends_the_headers() {
+        let server = TestServer::start(|_| Response::ok(b"{\"a\": 1}"));
+
+        let body = client()
+            .get(
+                &server.url("/api/thing?x=1"),
+                &[("Authorization", "Bearer secret")],
+            )
+            .unwrap();
+
+        assert_eq!(body, b"{\"a\": 1}");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/api/thing?x=1");
+        assert_eq!(requests[0].header("authorization"), Some("Bearer secret"));
+    }
+
+    #[test]
+    fn get_repeats_after_a_server_error_and_gives_up() {
+        let calls = AtomicUsize::new(0);
+        let server = TestServer::start(move |_| match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Response::status(502),
+            1 => Response::ok(b"ok"),
+            _ => Response::status(500),
+        });
+        let url = server.url("/api");
+
+        assert_eq!(client().get(&url, &[]).unwrap(), b"ok");
+        let error = client().get(&url, &[]).unwrap_err();
+
+        assert!(matches!(error, DownloadError::Failed { .. }), "{error}");
+        assert_eq!(server.requests().len(), 5);
+    }
+
+    #[test]
+    fn get_does_not_repeat_a_refused_request() {
+        let server = TestServer::start(|_| Response::status(401));
+
+        let error = client().get(&server.url("/api"), &[]).unwrap_err();
+
+        assert!(
+            matches!(error, DownloadError::Status { status: 401, .. }),
+            "{error}"
+        );
+        assert_eq!(server.requests().len(), 1);
     }
 
     #[test]

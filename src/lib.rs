@@ -2,6 +2,7 @@
 
 pub mod download;
 pub mod error;
+mod fsutil;
 pub mod hash;
 pub mod mirror;
 pub mod source;
@@ -9,6 +10,7 @@ pub mod store;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod testutil;
+pub mod upstream;
 
 /// Runs the application.
 ///
