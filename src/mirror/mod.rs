@@ -96,6 +96,16 @@ pub struct Pulled {
     pub skipped: usize,
 }
 
+/// A blob the database lists whose file is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingBlob {
+    /// Digest of the blob.
+    pub sha256: Sha256,
+    /// The snapshots that had it as the content of a file, each as
+    /// `<source>@<revision>`. Pulling them again restores the blob.
+    pub snapshots: Vec<String>,
+}
+
 /// What a garbage collection removed, or would remove, and what it found
 /// out of order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,8 +114,10 @@ pub struct Collected {
     pub blobs: Vec<(Sha256, u64)>,
     /// Partial files of downloads given up long ago.
     pub partials: Vec<PathBuf>,
-    /// Blobs the database lists whose files are gone.
-    pub missing: Vec<Sha256>,
+    /// Blobs the database listed whose files are gone. Unless this was a
+    /// dry run, they are forgotten and the files that had them as content
+    /// are no longer marked as fetched.
+    pub missing: Vec<MissingBlob>,
     /// Files among the blobs that the database does not list. They are
     /// left alone: a pull that is storing a blob right now looks like this.
     pub untracked: Vec<PathBuf>,
@@ -513,12 +525,36 @@ impl Mirror {
         let partials = clean_tmp(store.tmp_dir(), PARTIAL_MAX_AGE, dry_run)?;
 
         // The database and the directory should agree on what is stored.
+        // A blob the database lists without a file is forgotten, so that
+        // a pull downloads it again instead of taking it as stored.
+        let listed = self.db.blob_digests()?;
+        let mut missing = Vec::new();
+        for digest in &listed {
+            // In a dry run the unused blobs are still listed; whether
+            // their files exist no longer matters.
+            let unused = blobs.iter().any(|(blob, _)| blob == digest);
+            if !unused && !store.contains(digest) {
+                let snapshots = self
+                    .db
+                    .blob_snapshots(digest)?
+                    .into_iter()
+                    .map(|(source, revision)| format!("{source}@{revision}"))
+                    .collect();
+                missing.push(MissingBlob {
+                    sha256: *digest,
+                    snapshots,
+                });
+            }
+        }
+        if !dry_run {
+            let gone: Vec<Sha256> = missing.iter().map(|blob| blob.sha256).collect();
+            let forgotten = self
+                .db
+                .forget_blobs(&gone, |digest| !store.contains(digest))?;
+            // A pull stored the blob again in the meantime.
+            missing.retain(|blob| forgotten.contains(&blob.sha256));
+        }
         let known = self.db.blob_digests()?;
-        let missing = known
-            .iter()
-            .filter(|digest| !store.contains(digest))
-            .copied()
-            .collect();
         let untracked = store
             .blob_files()
             .map_err(Error::Store)?

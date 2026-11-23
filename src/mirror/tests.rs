@@ -890,7 +890,7 @@ fn gc_reports_what_database_and_directory_disagree_on() {
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
     let mut mirror = Mirror::open(dir.path()).unwrap();
-    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
     let weights = Sha256::of(b"weights");
     mirror.store.remove(&weights).unwrap();
     let stray = Sha256::of(b"stray");
@@ -898,10 +898,27 @@ fn gc_reports_what_database_and_directory_disagree_on() {
     fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
     fs::write(&stray_path, b"stray").unwrap();
 
+    let missing = [MissingBlob {
+        sha256: weights,
+        snapshots: vec![format!("{}@{COMMIT}", pulled.source)],
+    }];
+    let would = mirror.gc(Duration::ZERO, true).unwrap();
+    assert_eq!(would.missing, missing);
+
     let collected = mirror.gc(Duration::ZERO, false).unwrap();
 
     assert_eq!(collected.blobs, []);
-    assert_eq!(collected.missing, [weights]);
+    assert_eq!(collected.missing, missing);
     assert!(stray_path.exists());
-    assert_eq!(collected.untracked, [stray_path]);
+    assert_eq!(collected.untracked, std::slice::from_ref(&stray_path));
+
+    // The blob is forgotten, so there is nothing left to report, and the
+    // next pull downloads the file again.
+    let again = mirror.gc(Duration::ZERO, false).unwrap();
+    assert_eq!(again.missing, []);
+    assert_eq!(again.untracked, [stray_path]);
+    let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    assert_eq!(pulled.downloaded, 1);
+    assert_eq!(blob(&mirror, b"weights").unwrap(), b"weights");
+    assert_eq!(mirror.gc(Duration::ZERO, false).unwrap().missing, []);
 }

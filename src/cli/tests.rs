@@ -138,12 +138,15 @@ fn configure(root: &Path, content: &str) {
     fs::write(root.join("private/config.toml"), content).unwrap();
 }
 
-fn has_blob(root: &Path, content: &[u8]) -> bool {
+fn blob_path(root: &Path, content: &[u8]) -> PathBuf {
     let digest = Sha256::of(content).to_string();
     root.join("public/blobs/sha256")
         .join(&digest[..2])
         .join(&digest)
-        .is_file()
+}
+
+fn has_blob(root: &Path, content: &[u8]) -> bool {
+    blob_path(root, content).is_file()
 }
 
 fn authorizations(upstream: &Upstream) -> Vec<Option<String>> {
@@ -780,6 +783,35 @@ fn mirror_gc_keeps_what_snapshots_use() {
     assert!(has_blob(dir.path(), b"sample"));
 
     assert!(Cli::try_parse_from(["mvault", "mirror", "gc", "--min-age", "soon"]).is_err());
+}
+
+#[test]
+fn mirror_gc_makes_a_lost_blob_fetchable_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let pull = ["pull", "hf:example-org/example-model"];
+    run(&upstream, dir.path(), &[], &pull).result.unwrap();
+    fs::remove_file(blob_path(dir.path(), b"sample")).unwrap();
+
+    let would = run(&upstream, dir.path(), &[], &["gc", "-n"]);
+    let error = would.result.unwrap_err().to_string();
+    assert!(error.contains("run without --dry-run"), "{error}");
+    let found = run(&upstream, dir.path(), &[], &["gc"]);
+    let error = found.result.unwrap_err().to_string();
+    assert!(error.contains("1 blob(s) are missing"), "{error}");
+    assert!(
+        found
+            .err
+            .contains("used by hf:huggingface.co:example-org/example-model@"),
+        "{}",
+        found.err
+    );
+
+    let pulled = run(&upstream, dir.path(), &[], &pull);
+    pulled.result.unwrap();
+    assert!(pulled.out.contains("1 downloaded"), "{}", pulled.out);
+    assert!(has_blob(dir.path(), b"sample"));
+    run(&upstream, dir.path(), &[], &["gc"]).result.unwrap();
 }
 
 #[cfg(unix)]

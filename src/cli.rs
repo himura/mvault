@@ -249,10 +249,16 @@ fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<
             path.display()
         );
     }
-    for digest in &collected.missing {
+    for blob in &collected.missing {
         let _ = writeln!(
             context.err,
-            "warning: blob {digest} is in the database but its file is gone"
+            "warning: blob {} is in the database but its file is gone; used by {}",
+            blob.sha256,
+            if blob.snapshots.is_empty() {
+                "no snapshot".to_owned()
+            } else {
+                blob.snapshots.join(", ")
+            }
         );
     }
     let sizes: Vec<u64> = collected.blobs.iter().map(|(_, size)| *size).collect();
@@ -260,8 +266,13 @@ fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<
     if collected.missing.is_empty() {
         Ok(())
     } else {
+        let advice = if args.dry_run {
+            "run without --dry-run to mark their files as not fetched, then pull the snapshots above again"
+        } else {
+            "their files are now marked as not fetched; pull the snapshots above again"
+        };
         Err(Error::Invalid(format!(
-            "{} blob(s) are missing; pull their models again",
+            "{} blob(s) are missing: {advice}",
             collected.missing.len()
         )))
     }
