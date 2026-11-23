@@ -78,8 +78,10 @@ manifest、lock、ミラーの内部で共通に使う正規形。
   private/                                  # 公開しない
     mvault.db                               # SQLite (WAL)
     tmp/                                    # ダウンロード途中のファイルとそのロック
-    config.toml                             # ミラーの設定
+    config.toml                             # ミラーの設定 (任意)
 ```
+
+- `<host>` にポートが付く場合、ディレクトリ名では `:` を `_` に置き換える (`hub.example.com_8443`)。`:` をファイル名に使えない環境があり、`_` はホスト名に現れない
 
 - `public/` と `private/` は同じファイルシステムに置く (`tmp/` から `blobs/` へ `rename()` するため)
 - トークンや設定は `private/` とホームディレクトリにしか置かない。`public/` をそのまま公開しても漏れない
@@ -95,7 +97,7 @@ manifest、lock、ミラーの内部で共通に使う正規形。
 |---|---|---|
 | `blobs` | `sha256`, `size`, `created_at` | `public/blobs/` にある blob |
 | `snapshots` | `id`, `source`, `revision`, `fetched_at` | HF の commit / civitai の version ごとに 1 行 |
-| `snapshot_files` | `snapshot_id`, `path`, `file_id`, `size`, `sha256`, `kind`, `primary` | snapshot に含まれるファイル。未取得なら blob への参照なし |
+| `snapshot_files` | `snapshot_id`, `path`, `file_id`, `size`, `sha256`, `fetched`, `is_primary` | snapshot に含まれるファイル。`fetched` が立っていれば `sha256` の blob を参照している。未取得の間の `sha256` は上流が示した値 |
 | `refs` | `source`, `name`, `revision` | HF の revision 名 → commit、civitai の latest → version |
 
 - SQLite はミラーホストのローカルでだけ開く。NFS 越しには開かない
@@ -135,23 +137,31 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
 ```
 
 - HuggingFace: 指定した revision のファイルを、exclude に一致するものを除いてすべて取得する
-  - `--exclude` は glob。`/…/` で囲むと正規表現 (例: `--exclude 'assets/**' --exclude '/\.mp4$/'`)
+  - `--exclude` はリポジトリのルートからのパスに対する glob。`/…/` で囲むと正規表現 (例: `--exclude assets --exclude '/\.mp4$/'`)
+    - `/` を含まない glob は、ファイル名と各階層のディレクトリ名に対して照合する (どの深さでも一致)。`assets` はその名前のディレクトリ以下すべて、`*.mp4` はすべての mp4
+    - `/` を含む glob は、ルートからのパスと、その各階層のディレクトリに対して照合する。`*` は `/` をまたがず、`**` はまたぐ
+    - 正規表現はパス全体に対する部分一致
+  - ファイルを指す URL (`…/blob/<revision>/<path>`) は受け付けない。ミラーはリポジトリ単位で取得する
   - README や config.json などの非 LFS ファイルも blob として保存する
   - model info API の応答を `metadata/` に保存する
 - civitai: 既定は version の primary ファイルだけ。`--file-id` で選ぶか `--all-files` で全ファイル
   - models API と model-versions API の応答を `metadata/` に保存する (説明文、trainedWords、ファイルの hash、プレビュー画像の URL など)
   - プレビュー画像そのものは取得しない
 - 同じ snapshot を条件を変えて pull し直すと、取得済みファイルは和集合になる
+- 途中で失敗しても、それまでに取得できたファイルは snapshot に反映して公開する
 - 取り込みの手順
   1. 上流が示す sha256 の blob が既にあれば、ダウンロードせず参照だけ追加する
   2. `private/tmp/` に書きながら sha256 を計算する。途中ファイルは残し、次回は `Range` で続きを取る
-  3. 上流が示す sha256 と照合する。食い違えば途中ファイルを捨ててエラー
+     - 続きを取るのは、上流が sha256 を示すファイルだけ。示さないファイルは、上流で差し替わっても検出できないので、毎回最初から取る
+  3. 上流が示す sha256 とサイズに照合する。食い違えば途中ファイルを捨ててエラー
   4. 4.2 のトランザクションで確定する
 - 並行実行: 複数の pull を同時に走らせてよい
   - 同じファイルのダウンロードは `private/tmp/<key>.lock` の flock で 1 つに絞り、後から来た方は待つ。プロセスが死ねばロックは外れる
 - 接続エラー、途中切断、408 / 429 / 5xx は指数バックオフで再試行する
 
 ### 4.5 その他のミラーコマンド
+
+未実装。
 
 - `mvault mirror ls [source]`: ミラーにある snapshot と、そのファイル・サイズ・取得状況を表示する
 - `mvault mirror rm <source>[@<revision>]`: snapshot を消す (blob は GC が消す)。頻度は低い想定
@@ -165,8 +175,10 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
 
 - トークンはコマンドライン引数で受け取らない (`ps` やシェル履歴に残る)
 - HuggingFace: `HF_TOKEN` → `HF_TOKEN_PATH` → 公式 CLI が保存するトークンファイル
-- civitai: `CIVITAI_TOKEN` → `CIVITAI_TOKEN_FILE` (既定 `~/.config/mvault/civitai-token`) → 設定の `civitai.token_command` の出力
-- トークンは API のホストにだけ送り、CDN へのリダイレクト先には送らない
+  - `huggingface.co` にだけ送る。他のホストの hub には送らない
+- civitai: `CIVITAI_TOKEN` → `CIVITAI_TOKEN_FILE` (既定 `~/.config/mvault/civitai-token`) → 設定の `civitai.token_command` の出力 (未実装)
+  - ミラーの `private/config.toml` の `civitai.default_host` に書いたホストにだけ送る。URL の形だけで civitai 系と判定するので、任意の URL にトークンを送らないため
+- トークンは API のホストにだけ送り、CDN など別ホストのダウンロード URL やリダイレクト先には送らない
 - ログにはトークンの出所だけを出し、値は出さない
 
 ## 5. ノード
