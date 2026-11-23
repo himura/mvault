@@ -1,5 +1,8 @@
 //! Core library for the `mvault` command-line tool.
 
+pub mod hash;
+pub mod source;
+
 /// Runs the application.
 ///
 /// # Errors
