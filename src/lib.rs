@@ -1,7 +1,9 @@
 //! Core library for the `mvault` command-line tool.
 
 pub mod download;
+pub mod error;
 pub mod hash;
+pub mod mirror;
 pub mod source;
 pub mod store;
 #[cfg(test)]

@@ -9,7 +9,10 @@ repository = "https://github.com/himura/mvault"
 readme = "README.md"
 
 [dependencies]
+globset = "0.4.21"
 percent-encoding = "2.3.2"
+regex = "1.13.2"
+rusqlite = { version = "0.43.0", features = ["bundled", "fallible_uint"] }
 sha2 = "0.11.0"
 thiserror = "2.0.21"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls", "platform-verifier"] }
