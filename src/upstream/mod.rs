@@ -16,7 +16,7 @@ const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 /// Escapes `value` for use as one path segment of a URL.
-fn encode_segment(value: &str) -> String {
+pub(crate) fn encode_segment(value: &str) -> String {
     utf8_percent_encode(value, ESCAPED).to_string()
 }
 
