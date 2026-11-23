@@ -12,6 +12,34 @@ pub(crate) fn io_error(path: &Path) -> impl FnOnce(io::Error) -> Error {
     move |source| Error::Io { path, source }
 }
 
+/// Opens the lock file at `path`, creating it, and waits for the exclusive
+/// lock on it. The lock is released when the returned file is dropped.
+///
+/// A lock file may be removed by whoever holds its lock. A lock taken on a
+/// file that was removed meanwhile protects nothing, so the lock only
+/// counts if the file is still the one at `path`.
+pub(crate) fn lock_file(path: &Path) -> Result<fs::File> {
+    loop {
+        let file = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(io_error(path))?;
+        file.lock().map_err(io_error(path))?;
+        if is_at(&file, path) {
+            return Ok(file);
+        }
+    }
+}
+
+/// Whether the open `file` is the file at `path` right now.
+pub(crate) fn is_at(file: &fs::File, path: &Path) -> bool {
+    let open = file.try_clone().and_then(same_file::Handle::from_file);
+    let named = same_file::Handle::from_path(path);
+    matches!((open, named), (Ok(open), Ok(named)) if open == named)
+}
+
 /// Replaces `path` with `content`, creating the directories above it.
 ///
 /// Readers see either the old or the new content, never a part of it: the

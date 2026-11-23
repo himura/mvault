@@ -9,6 +9,7 @@ pub mod cli;
 pub mod download;
 pub mod error;
 mod fsutil;
+pub mod gc;
 pub mod hash;
 pub mod mirror;
 pub mod node;

@@ -6,13 +6,13 @@
 //! <root>/private/   mvault.db, tmp/                 (never served)
 //! ```
 
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
-use crate::fsutil::{io_error, write_atomic};
+use crate::fsutil::{io_error, lock_file, write_atomic};
 use crate::hash::Sha256;
 use crate::snapshot::{self, Snapshot, SnapshotFile};
 use crate::source::Source;
@@ -415,13 +415,7 @@ impl Mirror {
         // One process at a time works on a partial file. The lock goes away
         // with the process, so a crash leaves nothing to clean up by hand.
         let lock_path = partial.with_extension("lock");
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(io_error(&lock_path))?;
-        lock.lock().map_err(io_error(&lock_path))?;
+        let _guard = lock_file(&lock_path)?;
         if let Some(digest) = &announced
             && self.db.use_stored_blob(snapshot_id, file.key(), digest)?
         {

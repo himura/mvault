@@ -6,7 +6,7 @@
 //! other file belongs to the user and is left alone.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use super::resolve::{Access, fill_digests, parse_source, resolve};
 use super::workspace::Workspace;
 use crate::download::{Downloaded, Progress, Request};
 use crate::error::{Error, Result};
-use crate::fsutil::io_error;
+use crate::fsutil::{io_error, lock_file};
 use crate::hash::Sha256;
 use crate::source::Source;
 use crate::store::BlobStore;
@@ -309,13 +309,7 @@ fn fetch(
     let partial = store.partial_path(&key).map_err(Error::Store)?;
     // One process at a time works on a partial file; another sync waits.
     let lock_path = partial.with_extension("lock");
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(io_error(&lock_path))?;
-    lock.lock().map_err(io_error(&lock_path))?;
+    let _guard = lock_file(&lock_path)?;
 
     if let Some(digest) = placement.sha256 {
         if store.contains(&digest) {

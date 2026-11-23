@@ -62,6 +62,37 @@ impl BlobStore {
         self.blob_path(digest).is_file()
     }
 
+    /// The directory of unfinished files.
+    #[must_use]
+    pub fn tmp_dir(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Removes the blob with this digest. A blob that is not stored is not
+    /// an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be removed.
+    pub fn remove(&self, digest: &Sha256) -> io::Result<()> {
+        let path = self.blob_path(digest);
+        let removed = fs::remove_file(&path).or_else(|error| {
+            if error.kind() != io::ErrorKind::PermissionDenied {
+                return Err(error);
+            }
+            // Where a read-only file cannot be removed as it is.
+            let mut permissions = fs::metadata(&path)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions)?;
+            fs::remove_file(&path)
+        });
+        match removed {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(with_path(&error, &path)),
+            _ => Ok(()),
+        }
+    }
+
     /// The paths of every stored blob, in no particular order.
     ///
     /// # Errors
