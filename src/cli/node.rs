@@ -75,6 +75,20 @@ pub(super) struct SyncArgs {
     force: bool,
 }
 
+#[derive(Debug, Args)]
+pub(super) struct GcArgs {
+    /// Only show what would be removed
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+}
+
+pub(super) fn gc(args: &GcArgs, context: &mut Context<'_>) -> Result<()> {
+    let workspace = open(context)?;
+    let collected = crate::node::gc::gc(&workspace, args.dry_run)?;
+    let sizes: Vec<u64> = collected.blobs.iter().map(|(_, size)| *size).collect();
+    super::report_gc(context, args.dry_run, &sizes, collected.partials.len())
+}
+
 pub(super) fn init(args: &InitArgs, context: &mut Context<'_>) -> Result<()> {
     let dir = match &args.dir {
         Some(dir) => context.cwd.join(dir),

@@ -816,3 +816,92 @@ fn the_same_content_from_two_sources_is_stored_once() {
     assert_eq!((pulled.downloaded, pulled.reused), (0, 1));
     assert_eq!(upstream.downloads().len(), 2);
 }
+
+#[test]
+fn gc_removes_blobs_no_snapshot_uses() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::open(dir.path()).unwrap();
+    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    // A blob that was stored without any snapshot coming to use it.
+    let orphan = Sha256::of(b"orphan");
+    let partial = mirror.store.partial_path("orphan").unwrap();
+    fs::write(&partial, b"orphan").unwrap();
+    let key = FileEntry {
+        path: "x".into(),
+        file_id: None,
+        size: None,
+        sha256: None,
+        primary: false,
+        fetched: false,
+    };
+    let scratch = mirror
+        .db
+        .record_snapshot("hf:example.com:scratch", "r", std::slice::from_ref(&key))
+        .unwrap();
+    let store = mirror.store.clone();
+    mirror
+        .db
+        .record_blob(scratch, key.key(), &orphan, 6, || {
+            store
+                .commit(&partial, &orphan)
+                .map(|_| ())
+                .map_err(Error::Store)
+        })
+        .unwrap();
+    // The snapshot moves on to other content, leaving the blob unused.
+    mirror
+        .db
+        .record_blob(scratch, key.key(), &Sha256::of(b"{}"), 2, || Ok(()))
+        .unwrap();
+
+    // Too young to be removed yet.
+    assert_eq!(
+        mirror.gc(Duration::from_secs(3600), false).unwrap(),
+        Collected::default()
+    );
+
+    let would = mirror.gc(Duration::ZERO, true).unwrap();
+    assert_eq!(would.blobs, [(orphan, 6)]);
+    assert!(mirror.store.contains(&orphan));
+
+    let collected = mirror.gc(Duration::ZERO, false).unwrap();
+    assert_eq!(collected.blobs, [(orphan, 6)]);
+    assert!(!mirror.store.contains(&orphan));
+    assert_eq!(blob(&mirror, b"weights").unwrap(), b"weights");
+    assert_eq!(blob(&mirror, b"{}").unwrap(), b"{}");
+    assert_eq!(
+        mirror.gc(Duration::ZERO, false).unwrap(),
+        Collected::default()
+    );
+    // The lock files of the pull are gone as well.
+    assert_eq!(
+        fs::read_dir(dir.path().join("private/tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn gc_reports_what_database_and_directory_disagree_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::open(dir.path()).unwrap();
+    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    let weights = Sha256::of(b"weights");
+    mirror.store.remove(&weights).unwrap();
+    let stray = Sha256::of(b"stray");
+    let stray_path = mirror.store.blob_path(&stray);
+    fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+    fs::write(&stray_path, b"stray").unwrap();
+
+    let collected = mirror.gc(Duration::ZERO, false).unwrap();
+
+    assert_eq!(collected.blobs, []);
+    assert_eq!(collected.missing, [weights]);
+    assert!(stray_path.exists());
+    assert_eq!(collected.untracked, [stray_path]);
+}

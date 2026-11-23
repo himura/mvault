@@ -9,10 +9,12 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, lock_file, write_atomic};
+use crate::gc::{PARTIAL_MAX_AGE, clean_tmp};
 use crate::hash::Sha256;
 use crate::snapshot::{self, Snapshot, SnapshotFile};
 use crate::source::Source;
@@ -92,6 +94,21 @@ pub struct Pulled {
     pub present: usize,
     /// Files of the snapshot that this pull left out.
     pub skipped: usize,
+}
+
+/// What a garbage collection removed, or would remove, and what it found
+/// out of order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// Blobs no snapshot uses, with their sizes.
+    pub blobs: Vec<(Sha256, u64)>,
+    /// Partial files of downloads given up long ago.
+    pub partials: Vec<PathBuf>,
+    /// Blobs the database lists whose files are gone.
+    pub missing: Vec<Sha256>,
+    /// Files among the blobs that the database does not list. They are
+    /// left alone: a pull that is storing a blob right now looks like this.
+    pub untracked: Vec<PathBuf>,
 }
 
 /// What to pull from a hub.
@@ -471,6 +488,53 @@ impl Mirror {
             || prepared.commit().map(|_| ()).map_err(Error::Store),
         )?;
         Ok(Outcome::Downloaded)
+    }
+
+    /// Removes the blobs no snapshot uses that have been stored for at
+    /// least `min_age`, and what downloads left behind. With `dry_run`,
+    /// only reports.
+    ///
+    /// A blob is kept for `min_age` because a pull stores it before the
+    /// snapshot that uses it is complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database or the files cannot be read or
+    /// changed.
+    pub fn gc(&mut self, min_age: Duration, dry_run: bool) -> Result<Collected> {
+        let cutoff = db::now().saturating_sub(min_age.as_secs());
+        let store = &self.store;
+        let blobs = if dry_run {
+            self.db.unused_blobs(cutoff)?
+        } else {
+            self.db
+                .remove_unused_blobs(cutoff, |digest| store.remove(digest).map_err(Error::Store))?
+        };
+        let partials = clean_tmp(store.tmp_dir(), PARTIAL_MAX_AGE, dry_run)?;
+
+        // The database and the directory should agree on what is stored.
+        let known = self.db.blob_digests()?;
+        let missing = known
+            .iter()
+            .filter(|digest| !store.contains(digest))
+            .copied()
+            .collect();
+        let untracked = store
+            .blob_files()
+            .map_err(Error::Store)?
+            .into_iter()
+            .filter(|path| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.parse()
+                    .map_or(true, |digest: Sha256| known.binary_search(&digest).is_err())
+            })
+            .collect();
+        Ok(Collected {
+            blobs,
+            partials,
+            missing,
+            untracked,
+        })
     }
 
     /// Writes the files nodes resolve a model from: the snapshot, and the

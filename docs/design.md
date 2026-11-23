@@ -163,14 +163,16 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
 
 ### 4.5 その他のミラーコマンド
 
-未実装。
+`gc` 以外は未実装。
 
 - `mvault mirror ls [source]`: ミラーにある snapshot と、そのファイル・サイズ・取得状況を表示する
 - `mvault mirror rm <source>[@<revision>]`: snapshot を消す (blob は GC が消す)。頻度は低い想定
 - `mvault mirror gc [-n] [--min-age <期間>]`: どの snapshot からも参照されない blob を消す
   - 作成から `--min-age` (既定 1 日) 経っていないものは消さない
-  - `tmp/` の途中ファイルは、ロックされておらず十分古いものだけ消す
-  - DB に行がない `blobs/` 内のファイル、ファイルがない DB の行を報告する
+  - blob の削除は 4.2 のトランザクションの中で行う。実行中の pull は待たされるだけで、消された blob を使い始めることはない
+  - `tmp/` の途中ファイルは、ロックされておらず 7 日より古いものだけ消す。終わったダウンロードのロックファイルも消す
+    - ロックファイルはロックを握ったまま消す。ロックを取る側は、取れた後にそのファイルがまだ同じパスにあるかを確かめ、無ければ取り直す
+  - DB に行がない `blobs/` 内のファイル、ファイルがない DB の行を報告する。前者は消さない (確定途中の pull と区別できないため)。後者があれば終了コードは 0 以外
 - `mvault mirror export`: `public/snapshots/` を DB から書き直す (修復用)
 
 ### 4.6 認証
@@ -345,7 +347,7 @@ manifest を使うコマンドは、カレントディレクトリから親へ `
 - 複数の `sync` を同時に走らせてよい。同じ blob の取得は `.mvault/tmp/` の flock で 1 つに絞る
 - `-n` は予定だけ表示する
 
-`update` / `ls` / `status` / `gc` は未実装。
+`update` / `ls` / `status` は未実装。
 
 **`mvault update [source]...`**
 
@@ -362,6 +364,10 @@ manifest を使うコマンドは、カレントディレクトリから親へ `
 **`mvault gc [-n]`**
 
 - `.mvault/blobs/` のうち、どこからも hardlink されていない blob (`st_nlink == 1`) を消す
+  - blob を複数の workspace で共有していても、どこかに配置されていればリンク数が 2 以上なので残る
+  - `sync` は取得から配置までリンク数 1 の blob を持つ。`sync` が共有ロック、`gc` が排他ロック (`.mvault/tmp/gc.lock`) を取って、その間に消さないようにする
+  - 7 日より古い途中ファイルと、終わったダウンロードのロックファイルも消す
+  - リンク数を調べられない環境 (Unix 以外) ではエラーにする
 
 ## 6. テストと公開リポジトリとしての方針
 

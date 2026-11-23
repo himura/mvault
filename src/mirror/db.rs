@@ -286,6 +286,63 @@ impl Db {
         Ok(())
     }
 
+    /// The blobs no snapshot uses that were stored at or before `cutoff`
+    /// (seconds since the Unix epoch), with their sizes, ordered by digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn unused_blobs(&self, cutoff: u64) -> Result<Vec<(Sha256, u64)>> {
+        unused_blobs(&self.conn, cutoff)
+    }
+
+    /// Forgets the blobs no snapshot uses that were stored at or before
+    /// `cutoff`, calling `remove` for each to delete its file.
+    ///
+    /// This runs while this process holds the write lock of the database,
+    /// so no pull can start using a blob while it is being removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `remove`, or an error if the database cannot be
+    /// written. Blobs removed before an error stay removed.
+    pub fn remove_unused_blobs(
+        &mut self,
+        cutoff: u64,
+        mut remove: impl FnMut(&Sha256) -> Result<()>,
+    ) -> Result<Vec<(Sha256, u64)>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let unused = unused_blobs(&tx, cutoff)?;
+        let mut removed = Vec::new();
+        let mut failure = None;
+        for (digest, size) in unused {
+            if let Err(error) = remove(&digest) {
+                failure = Some(error);
+                break;
+            }
+            tx.execute("DELETE FROM blobs WHERE sha256 = ?1", [digest.to_string()])?;
+            removed.push((digest, size));
+        }
+        // What was removed from disk must also go from the database.
+        tx.commit()?;
+        failure.map_or(Ok(removed), Err)
+    }
+
+    /// The digest of every blob the database knows, ordered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn blob_digests(&self) -> Result<Vec<Sha256>> {
+        let mut select = self
+            .conn
+            .prepare("SELECT sha256 FROM blobs ORDER BY sha256")?;
+        let rows = select.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|hex| parse_digest(&hex?)).collect()
+    }
+
     /// Makes `name` (a branch, a tag, "latest") stand for `revision`.
     ///
     /// # Errors
@@ -342,8 +399,32 @@ fn mark_fetched(
     }
 }
 
+fn unused_blobs(conn: &Connection, cutoff: u64) -> Result<Vec<(Sha256, u64)>> {
+    let mut select = conn.prepare(
+        "SELECT sha256, size FROM blobs
+         WHERE created_at <= ?1 AND NOT EXISTS (
+             SELECT 1 FROM snapshot_files
+             WHERE snapshot_files.sha256 = blobs.sha256 AND snapshot_files.fetched
+         )
+         ORDER BY sha256",
+    )?;
+    let rows = select.query_map([cutoff], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    rows.map(|row| {
+        let (hex, size) = row?;
+        Ok((parse_digest(&hex)?, size))
+    })
+    .collect()
+}
+
+fn parse_digest(hex: &str) -> Result<Sha256> {
+    hex.parse()
+        .map_err(|e| Error::Invalid(format!("database: {e}")))
+}
+
 /// Seconds since the Unix epoch.
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())

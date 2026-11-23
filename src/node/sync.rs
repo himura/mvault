@@ -10,6 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use super::gc::gc_lock;
 use super::lock::Lock;
 use super::manifest::{Manifest, STATE_DIR};
 use super::plan::{Placement, plan, unresolved};
@@ -98,6 +99,13 @@ pub fn sync(
     options: Options,
     on_event: &mut dyn FnMut(Event<'_>),
 ) -> Result<Report> {
+    // Held to the end: a garbage collection must not take a blob away
+    // between its fetch and its first link.
+    let _in_use = if options.dry_run {
+        None
+    } else {
+        Some(gc_lock(&workspace.store, false)?)
+    };
     let mut report = Report::default();
     let manifest = Manifest::load(&workspace.root, &workspace.defaults())?;
     let lock_path = workspace.lock_path();

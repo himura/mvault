@@ -751,3 +751,85 @@ fn node_commands_need_a_workspace() {
         second.out
     );
 }
+
+#[test]
+fn mirror_gc_keeps_what_snapshots_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    run(
+        &upstream,
+        dir.path(),
+        &[],
+        &["pull", "hf:example-org/example-model"],
+    )
+    .result
+    .unwrap();
+
+    let young = run(&upstream, dir.path(), &[], &["gc"]);
+    young.result.unwrap();
+    assert_eq!(
+        young.out,
+        "removed 0 blob(s) (0 B), 0 unfinished download(s)\n"
+    );
+    let all = run(&upstream, dir.path(), &[], &["gc", "-n", "--min-age", "0"]);
+    all.result.unwrap();
+    assert_eq!(
+        all.out,
+        "would remove 0 blob(s) (0 B), 0 unfinished download(s)\n"
+    );
+    assert!(has_blob(dir.path(), b"sample"));
+
+    assert!(Cli::try_parse_from(["mvault", "mirror", "gc", "--min-age", "soon"]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_removes_blobs_of_files_that_were_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &[
+            "add",
+            "hf:example-org/example-model",
+            "--dest",
+            "x/",
+            "--path",
+            "config.json",
+        ],
+    )
+    .result
+    .unwrap();
+    run_in(&upstream, &workspace, &[], &["sync"])
+        .result
+        .unwrap();
+
+    let nothing = run_in(&upstream, &workspace, &[], &["gc"]);
+    nothing.result.unwrap();
+    assert_eq!(
+        nothing.out,
+        "removed 0 blob(s) (0 B), 0 unfinished download(s)\n"
+    );
+
+    fs::remove_file(workspace.join("x/config.json")).unwrap();
+    let would = run_in(&upstream, &workspace, &[], &["gc", "--dry-run"]);
+    assert_eq!(
+        would.out,
+        "would remove 1 blob(s) (2 B), 0 unfinished download(s)\n"
+    );
+    let removed = run_in(&upstream, &workspace, &[], &["gc"]);
+    assert_eq!(
+        removed.out,
+        "removed 1 blob(s) (2 B), 0 unfinished download(s)\n"
+    );
+
+    // The next sync fetches it again.
+    let synced = run_in(&upstream, &workspace, &[], &["sync"]);
+    assert_eq!(
+        synced.out,
+        "0 resolved, 1 fetched, 1 linked, 0 unchanged, 0 pruned (done)\n"
+    );
+}

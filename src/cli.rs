@@ -32,6 +32,8 @@ enum Command {
     Add(node::AddArgs),
     /// Fetch and place the models of the manifest
     Sync(node::SyncArgs),
+    /// Remove the blobs of this node that no file is linked to
+    Gc(node::GcArgs),
     /// Maintain a mirror (run on the host that stores it)
     Mirror(MirrorArgs),
 }
@@ -49,6 +51,19 @@ struct MirrorArgs {
 enum MirrorCommand {
     /// Fetch a repository or a model version from its upstream
     Pull(PullArgs),
+    /// Remove the blobs no snapshot uses, and unfinished downloads
+    Gc(MirrorGcArgs),
+}
+
+#[derive(Debug, Args)]
+struct MirrorGcArgs {
+    /// Only show what would be removed
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    /// Keep blobs stored more recently than this, such as 12h or 7d: a
+    /// pull that is still running may be about to use them
+    #[arg(long, value_name = "AGE", default_value = "1d", value_parser = crate::gc::parse_duration)]
+    min_age: Duration,
 }
 
 #[derive(Debug, Args)]
@@ -110,12 +125,14 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
         Command::Init(args) => node::init(&args, context),
         Command::Add(args) => node::add(&args, context),
         Command::Sync(args) => node::sync(&args, context),
+        Command::Gc(args) => node::gc(&args, context),
         Command::Mirror(mirror) => {
             let root = mirror.root.ok_or_else(|| {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
             match mirror.command {
                 MirrorCommand::Pull(args) => pull(&root, &args, context),
+                MirrorCommand::Gc(args) => mirror_gc(&root, &args, context),
             }
         }
     }
@@ -219,6 +236,50 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
     writeln!(
         context.out,
         "{source}@{revision}: {downloaded} downloaded, {reused} reused, {present} already present, {skipped} not fetched"
+    )
+    .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<'_>) -> Result<()> {
+    let collected = Mirror::open(root)?.gc(args.min_age, args.dry_run)?;
+    for path in &collected.untracked {
+        let _ = writeln!(
+            context.err,
+            "warning: {} is not in the database; left alone",
+            path.display()
+        );
+    }
+    for digest in &collected.missing {
+        let _ = writeln!(
+            context.err,
+            "warning: blob {digest} is in the database but its file is gone"
+        );
+    }
+    let sizes: Vec<u64> = collected.blobs.iter().map(|(_, size)| *size).collect();
+    report_gc(context, args.dry_run, &sizes, collected.partials.len())?;
+    if collected.missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "{} blob(s) are missing; pull their models again",
+            collected.missing.len()
+        )))
+    }
+}
+
+/// Prints the result line of a garbage collection.
+fn report_gc(
+    context: &mut Context<'_>,
+    dry_run: bool,
+    sizes: &[u64],
+    partials: usize,
+) -> Result<()> {
+    let verb = if dry_run { "would remove" } else { "removed" };
+    writeln!(
+        context.out,
+        "{verb} {} blob(s) ({}), {partials} unfinished download(s)",
+        sizes.len(),
+        human_size(sizes.iter().sum())
     )
     .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
 }
