@@ -73,6 +73,19 @@ impl FromStr for Sha256 {
     }
 }
 
+impl serde::Serialize for Sha256 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Sha256 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let hex = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        hex.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 fn hex_value(digit: u8) -> Option<u8> {
     match digit {
         b'0'..=b'9' => Some(digit - b'0'),

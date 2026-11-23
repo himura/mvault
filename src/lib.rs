@@ -11,6 +11,7 @@ pub mod error;
 mod fsutil;
 pub mod hash;
 pub mod mirror;
+pub mod snapshot;
 pub mod source;
 pub mod store;
 #[cfg(test)]
