@@ -471,18 +471,18 @@ impl Mirror {
             });
         }
 
-        let store = &self.store;
+        // Flushing a large file takes long; it is done before the database is
+        // locked, so that other pulls are not kept waiting for it.
+        let prepared = self
+            .store
+            .prepare(&partial, &downloaded.sha256)
+            .map_err(Error::Store)?;
         self.db.record_blob(
             snapshot_id,
             file.key(),
             &downloaded.sha256,
             downloaded.size,
-            || {
-                store
-                    .commit(&partial, &downloaded.sha256)
-                    .map(|_| ())
-                    .map_err(Error::Store)
-            },
+            || prepared.commit().map(|_| ()).map_err(Error::Store),
         )?;
         Ok(Outcome::Downloaded)
     }

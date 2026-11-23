@@ -97,30 +97,74 @@ impl BlobStore {
     /// Returns an error if the file cannot be flushed to disk, made
     /// read-only or renamed into place.
     pub fn commit(&self, file: &Path, digest: &Sha256) -> io::Result<Committed> {
+        self.prepare(file, digest)?.commit()
+    }
+
+    /// Does the slow part of [`BlobStore::commit`]: flushes the file to disk
+    /// and creates the directory it goes to. What is left for
+    /// [`Prepared::commit`] is quick, so that it can run while a lock is
+    /// held that others wait for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be flushed to disk or the
+    /// directory cannot be created.
+    pub fn prepare(&self, file: &Path, digest: &Sha256) -> io::Result<Prepared> {
         let dest = self.blob_path(digest);
+        if !dest.is_file() {
+            // Opened for writing: not every platform can flush a read-only
+            // handle.
+            File::options()
+                .write(true)
+                .open(file)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| with_path(&e, file))?;
+            let dir = dest.parent().unwrap_or(&self.blobs);
+            fs::create_dir_all(dir).map_err(|e| with_path(&e, dir))?;
+        }
+        Ok(Prepared {
+            file: file.to_owned(),
+            dest,
+        })
+    }
+}
+
+/// A file that is flushed to disk and ready to become a blob.
+#[derive(Debug)]
+#[must_use = "the file is not a blob until it is committed"]
+pub struct Prepared {
+    file: PathBuf,
+    dest: PathBuf,
+}
+
+impl Prepared {
+    /// Makes the file a blob: read-only, at its place in the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be made read-only or renamed
+    /// into place.
+    pub fn commit(self) -> io::Result<Committed> {
+        let Self { file, dest } = self;
+        // Another writer may have stored the blob since the file was
+        // prepared.
         if dest.is_file() {
-            fs::remove_file(file).map_err(|e| with_path(&e, file))?;
+            fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
             return Ok(Committed::AlreadyPresent);
         }
-        // Opened for writing: not every platform can flush a read-only handle.
-        File::options()
-            .write(true)
-            .open(file)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| with_path(&e, file))?;
-        make_read_only(file).map_err(|e| with_path(&e, file))?;
-        let dir = dest.parent().unwrap_or(&self.blobs);
-        fs::create_dir_all(dir).map_err(|e| with_path(&e, dir))?;
-        if let Err(e) = fs::rename(file, &dest) {
+        make_read_only(&file).map_err(|e| with_path(&e, &file))?;
+        if let Err(e) = fs::rename(&file, &dest) {
             // Where a rename does not replace a read-only file, losing the
             // race against another writer of the same blob ends up here.
             if dest.is_file() {
-                fs::remove_file(file).map_err(|e| with_path(&e, file))?;
+                fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
                 return Ok(Committed::AlreadyPresent);
             }
             return Err(with_path(&e, &dest));
         }
-        sync_dir(dir).map_err(|e| with_path(&e, dir))?;
+        if let Some(dir) = dest.parent() {
+            sync_dir(dir).map_err(|e| with_path(&e, dir))?;
+        }
         Ok(Committed::Added)
     }
 }
@@ -220,6 +264,38 @@ mod tests {
         );
         assert!(!second.exists());
         assert_eq!(fs::read(store.blob_path(&digest)).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn a_prepared_file_stays_writable_until_it_is_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        let partial = write_partial(&store, "one", b"abc");
+
+        let prepared = store.prepare(&partial, &digest).unwrap();
+
+        assert!(partial.exists());
+        assert!(!fs::metadata(&partial).unwrap().permissions().readonly());
+        assert!(!store.contains(&digest));
+        assert_eq!(prepared.commit().unwrap(), Committed::Added);
+        assert!(!partial.exists());
+        assert_eq!(fs::read(store.blob_path(&digest)).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn committing_a_prepared_file_yields_to_a_blob_stored_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        let first = write_partial(&store, "one", b"abc");
+        let second = write_partial(&store, "two", b"abc");
+
+        let prepared = store.prepare(&second, &digest).unwrap();
+        store.commit(&first, &digest).unwrap();
+
+        assert_eq!(prepared.commit().unwrap(), Committed::AlreadyPresent);
+        assert!(!second.exists());
     }
 
     #[test]
