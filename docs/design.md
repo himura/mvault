@@ -268,7 +268,8 @@ files = [
   - HuggingFace: リポジトリ全体を、`exclude` を除いて、ツリーを保って `dest` の下に置く
   - civitai: primary ファイルを置く
 - 同じ `source` と `revision` のエントリが複数あれば、読み込み時に 1 つにまとめる (`add` が末尾への追記だけで済むように)
-- 同じ配置先に違う内容が来ればエラー
+- 同じ配置先に違うファイルが来ればエラー。あるファイルの配置先が、別のファイルの配置先のディレクトリになる場合もエラー
+- `source` は正規形で書く。URL は `mvault add` が正規形に直す
 - 知らないキーはエラー
 
 ### 5.4 lock (`mvault.lock`)
@@ -283,6 +284,8 @@ source = "hf:huggingface.co:example-org/example-repackaged"
 revision = "main"
 resolved = "0123456789abcdef0123456789abcdef01234567"
 files = [
+  { path = "README.md", size = 1234 },
+  { path = "split_files/upscaler/2x_foo.pth", size = 99, sha256 = "…" },
   { path = "split_files/upscaler/4x_foo.pth", size = 123, sha256 = "…" },
   { path = "split_files/vae/x_vae.safetensors", size = 456, sha256 = "…" },
 ]
@@ -290,10 +293,14 @@ files = [
 
 - キーは `source` (正規形) と `revision`。`dest` や、どの manifest ファイルに書いたかは含まない
   - 配置先を変えても、エントリを別の toml に移しても、lock は有効
-- civitai のファイルは `file_id` も持つ (`path` はファイル名)
-- `files` は manifest の `files` / `exclude` / glob を展開した結果。上流が進んで一致するファイルが増えても、`update` するまで変わらない
+- civitai のファイルは `file_id` も持つ (`path` はファイル名)。primary ファイルには `primary = true` が付く
+- `files` は、解決した commit / version に上流が持つ全ファイルの一覧。manifest で選んでいないファイルも入る
+  - どれを配置するかは、`sync` のたびに manifest の `files` / `exclude` / glob をこの一覧に当てて決める
+  - そのため `files` / `exclude` / `dest` を編集しても再解決は起きない。再解決が要るのは `source` か `revision` を変えたときと `mvault update` だけ
+  - 展開結果だけを書く形にしなかったのは、glob や `exclude` を書き換えたときに lock が古いかどうかを判定できないため
+  - 上流が進んでファイルが増えても、`update` するまで一覧は変わらない
 - 上流から直接解決したファイルは、sha256 が分からないことがある (HuggingFace の API が sha256 を返すのは LFS ファイルだけ)
-  - その場合は `sha256` を書かずに lock に入れ、最初の `sync` で取得したときに計算した値を書き込む
+  - その場合は `sha256` を書かずに lock に入れ、`sync` がミラーの snapshot から埋める。ミラーに無ければ、上流から取得したときに計算した値を書き込む
   - 一度書き込まれたら、以後は他のファイルと同じく照合に使う
   - ミラーの snapshot から解決した場合は、全ファイルの sha256 が最初から入る
 - 出力は決まった順 (source、path) に並べ、差分を読みやすくする
@@ -311,26 +318,34 @@ manifest を使うコマンドは、カレントディレクトリから親へ `
 **`mvault add <URL | 正規形> --dest <path> [--path <pattern>]... [--file-id <id>]... [--file <toml>]`**
 
 - `--path` は HuggingFace、`--file-id` は civitai のファイル指定。URL に含まれるファイルのパスや `?fileId=` も同じ意味で読む
+- HuggingFace は `--revision <rev>` も指定できる (URL に revision があればそれを使う)
+- manifest には正規形で書く。`huggingface.co` はホストを省いて `hf:<org>/<repo>` と書く
 - モデルの情報を解決する。ミラーの snapshot を先に見て、無ければ上流の API に問い合わせる
 - manifest の末尾に `[[model]]` をテキストとして追記する (既存のコメントや並びを崩さない)。追記先は既定で `mvault.toml`、`--file` で include 先を指定する
 - lock に解決結果を書く
 - モデルファイルのダウンロードはしない
-- 同じ内容のエントリが既にあれば、警告して何もしない
+- 同じ内容のエントリが既にあれば、何も書かずにその旨を表示する
+- 書き込む前に確かめる: モデルが解決できること、指定したファイルがそのモデルにあること、配置先が他のファイルとぶつからないこと。どれかが駄目なら何も書かない
 
 **`mvault sync [-n] [--locked] [--prune] [--force]`**
 
 1. manifest にあって lock にないエントリを、`add` と同じ手順で解決して lock に書き足す。`--locked` ではエラーにする
-2. lock の各ファイルについて、`.mvault/blobs/` に無いものだけをミラーから取得する
+2. 配置するファイルのうち、`.mvault/blobs/` に無いものだけをミラーから取得する
+   - ミラーは設定の順に試す。読めないミラーは警告を出して次へ進む
+   - 取得した内容の sha256 が lock と違えば、そのミラーの名前を挙げてエラーにする
    - どのミラーにも無ければエラー。ミラーホストで実行する `mvault mirror pull …` を表示する
    - `allow_official = true` のときは上流から取得する
 3. 配置先に hardlink する
    - 既に同じ blob の hardlink なら何もしない
    - 管理下の別の内容なら差し替える (一時名で link してから `rename()`)
-   - 管理下でないファイルがあれば上書きせず、衝突として報告する (`--force` で上書き)
-4. `--prune`: manifest から外れた管理下のファイルを消す
+   - 管理下でないファイルがあれば上書きせず、衝突として報告する (`--force` で上書き)。衝突があれば終了コードは 0 以外
+   - 「管理下」とは、blob と同じファイル (hardlink) であること。サイズが同じ blob とだけ比べる
+4. `--prune`: manifest から外れた管理下のファイルを消す。調べるのは、manifest がファイルを置くディレクトリの中だけ
 
 - 複数の `sync` を同時に走らせてよい。同じ blob の取得は `.mvault/tmp/` の flock で 1 つに絞る
 - `-n` は予定だけ表示する
+
+`update` / `ls` / `status` / `gc` は未実装。
 
 **`mvault update [source]...`**
 
