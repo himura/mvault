@@ -90,6 +90,17 @@ pub fn plan(manifest: &Manifest, lock: &Lock) -> Result<Vec<Placement>> {
             placements.insert(dest, placement);
         }
     }
+    // Sorted, so what is below a destination follows it closely.
+    for dest in placements.keys() {
+        let below = format!("{dest}/");
+        if let Some((other, _)) = placements.range(below.clone()..).next()
+            && other.starts_with(&below)
+        {
+            return Err(Error::Invalid(format!(
+                "{dest} is both a file and a directory (of {other})"
+            )));
+        }
+    }
     Ok(placements.into_values().collect())
 }
 
@@ -380,6 +391,12 @@ mod tests {
                     "{hf}files = [{{ path = \"README.md\", dest = \"a/x\" }}, {{ path = \"assets/sample.mp4\", dest = \"a/x\" }}]\n"
                 ),
                 "a/x is given twice",
+            ),
+            (
+                format!(
+                    "{hf}files = [{{ path = \"README.md\", dest = \"a/x\" }}, {{ path = \"assets/sample.mp4\", dest = \"a/x/\" }}]\n"
+                ),
+                "a/x is both a file and a directory (of a/x/sample.mp4)",
             ),
             (
                 format!(

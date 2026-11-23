@@ -154,6 +154,13 @@ fn read(workspace: &Path, file: &str) -> Result<RawManifest> {
     toml::from_str(&text).map_err(|e| Error::Invalid(format!("{file}: {e}")))
 }
 
+/// The models written in `text`, the content of the manifest file `file`.
+pub(crate) fn parse_text(text: &str, file: &str, defaults: &Defaults) -> Result<Vec<Model>> {
+    let raw: RawManifest =
+        toml::from_str(text).map_err(|e| Error::Invalid(format!("{file}: {e}")))?;
+    parse_models(raw.model, file, defaults)
+}
+
 /// The files `include` names, in the order written; the matches of a glob
 /// in the order of their names.
 fn included_files(workspace: &Path, patterns: &[String]) -> Result<Vec<String>> {
