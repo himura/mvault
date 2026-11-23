@@ -149,6 +149,7 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
   - プレビュー画像そのものは取得しない
 - 同じ snapshot を条件を変えて pull し直すと、取得済みファイルは和集合になる
 - 途中で失敗しても、それまでに取得できたファイルは snapshot に反映して公開する
+  - `refs/<revision>` と `latest` を動かすのは、選んだファイルをすべて取得できた pull だけ。失敗した pull の後も、名前は以前の (ノードが使える) snapshot を指し続ける
 - 取り込みの手順
   1. 上流が示す sha256 の blob が既にあれば、ダウンロードせず参照だけ追加する
   2. `private/tmp/` に書きながら sha256 を計算する。途中ファイルは残し、次回は `Range` で続きを取る

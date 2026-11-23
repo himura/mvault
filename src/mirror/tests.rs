@@ -230,6 +230,46 @@ fn hf_pull_of_a_new_commit_reuses_blobs_and_moves_the_ref() {
 }
 
 #[test]
+fn hf_pull_that_fails_leaves_the_ref_where_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::open(dir.path()).unwrap();
+    pull_hf(&mut mirror, &upstream, "main", &[]).unwrap();
+
+    // The upstream moves on, and a file of the new commit cannot be fetched.
+    let newer = "1111111111111111111111111111111111111111";
+    upstream.route(
+        &format!("/api/models/{REPO}/revision/main?blobs=true"),
+        format!(
+            r#"{{"sha": "{newer}", "siblings": [
+                {{"rfilename": "config.json", "size": 2}},
+                {{"rfilename": "missing.bin", "size": 5}}
+            ]}}"#
+        )
+        .as_bytes(),
+    );
+    upstream.route(&format!("/{REPO}/resolve/{newer}/config.json"), b"{}");
+    let main = mirror
+        .public_dir()
+        .join(format!("snapshots/hf/{HOST}/{REPO}/refs/main"));
+
+    assert!(pull_hf(&mut mirror, &upstream, "main", &[]).is_err());
+
+    assert_eq!(fs::read_to_string(&main).unwrap(), format!("{COMMIT}\n"));
+    // What was fetched is still published.
+    let files = &hf_snapshot(&mirror, newer)["files"];
+    assert_eq!(files[0]["path"], "config.json");
+    assert_eq!(files[0].get("fetched"), None);
+    assert_eq!(files[1]["fetched"], false);
+
+    // Once the file can be fetched, the ref follows.
+    upstream.route(&format!("/{REPO}/resolve/{newer}/missing.bin"), b"found");
+    pull_hf(&mut mirror, &upstream, "main", &[]).unwrap();
+    assert_eq!(fs::read_to_string(&main).unwrap(), format!("{newer}\n"));
+}
+
+#[test]
 fn hf_pull_by_commit_writes_no_ref() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
@@ -558,6 +598,27 @@ fn civitai_pull_of_the_latest_version_fetches_the_primary_file() {
     for request in upstream.server.requests() {
         assert_eq!(request.header("authorization"), Some("Bearer secret"));
     }
+}
+
+#[test]
+fn civitai_pull_that_fails_does_not_set_latest() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    site_with_model(&upstream);
+    upstream.route("/api/download/models/67890?type=Pruned", b"other");
+    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let latest = mirror
+        .public_dir()
+        .join(format!("snapshots/civitai/{SITE}/12345/latest"));
+
+    assert!(pull_civitai(&mut mirror, &upstream, None, &Selection::All).is_err());
+
+    assert!(!latest.exists());
+    assert_eq!(civitai_snapshot(&mirror)["files"][0].get("fetched"), None);
+
+    upstream.route("/api/download/models/67890?type=Pruned", b"pruned");
+    pull_civitai(&mut mirror, &upstream, None, &Selection::All).unwrap();
+    assert_eq!(fs::read_to_string(&latest).unwrap(), "67890\n");
 }
 
 #[test]

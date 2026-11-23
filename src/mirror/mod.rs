@@ -162,7 +162,8 @@ impl Mirror {
     ///
     /// The snapshot written for nodes lists every file of the repository;
     /// those not fetched are marked as such. Pulling the same commit again
-    /// only adds to what is fetched.
+    /// only adds to what is fetched. `revision`, if it is a name, stands for
+    /// the commit once every file asked for is fetched, and not before.
     ///
     /// # Errors
     ///
@@ -208,9 +209,6 @@ impl Mirror {
             })
             .collect();
         let snapshot_id = self.db.record_snapshot(&source, &commit, &listed)?;
-        if revision != commit {
-            self.db.set_ref(&source, revision, &commit)?;
-        }
 
         let files = self.db.snapshot_files(snapshot_id)?;
         let jobs: Vec<Job<'_>> = files
@@ -222,9 +220,19 @@ impl Mirror {
             })
             .collect();
         let mut pulled = Pulled::new(source, commit, files.len() - jobs.len());
-        let result = self.fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
-            hub.headers_for(url)
-        });
+        let result = self
+            .fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
+                hub.headers_for(url)
+            })
+            // A name only moves to a snapshot that has what was asked for:
+            // after a failure it keeps standing for the one nodes can use.
+            .and_then(|()| {
+                if revision == pulled.revision {
+                    Ok(())
+                } else {
+                    self.db.set_ref(&pulled.source, revision, &pulled.revision)
+                }
+            });
 
         // Also after a failure: what was fetched before it is worth serving.
         let snapshots = self.public.join("snapshots").join(&dir);
@@ -239,7 +247,8 @@ impl Mirror {
     }
 
     /// Fetches files of a model version; of the latest one if `version_id`
-    /// is `None`.
+    /// is `None`, which then becomes what "latest" stands for once the files
+    /// asked for are fetched.
     ///
     /// # Errors
     ///
@@ -317,9 +326,6 @@ impl Mirror {
 
         let revision = version_id.to_string();
         let snapshot_id = self.db.record_snapshot(&source, &revision, &listed)?;
-        if resolved_latest {
-            self.db.set_ref(&source, "latest", &revision)?;
-        }
 
         let files = self.db.snapshot_files(snapshot_id)?;
         let jobs: Vec<Job<'_>> = files
@@ -337,9 +343,17 @@ impl Mirror {
             })
             .collect();
         let mut pulled = Pulled::new(source, revision, files.len() - jobs.len());
-        let result = self.fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
-            site.headers_for(url)
-        });
+        let result = self
+            .fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
+                site.headers_for(url)
+            })
+            .and_then(|()| {
+                if resolved_latest {
+                    self.db.set_ref(&pulled.source, "latest", &pulled.revision)
+                } else {
+                    Ok(())
+                }
+            });
 
         let snapshots = self.public.join("snapshots").join(&dir);
         self.export_snapshot(snapshot_id, &pulled, &snapshots)?;
