@@ -11,8 +11,8 @@ use percent_encoding::percent_decode_str;
 /// The host assumed for a `hf:` source that does not name one.
 pub const DEFAULT_HF_HOST: &str = "huggingface.co";
 
+/// The port of https, the only scheme an upstream is reached over.
 const HTTPS_PORT: u16 = 443;
-const HTTP_PORT: u16 = 80;
 
 /// The origin of a model: a repository or a model version on an upstream host.
 ///
@@ -21,8 +21,8 @@ const HTTP_PORT: u16 = 80;
 ///
 /// A host has exactly one spelling, so that it can serve as a key and as a
 /// directory name: lowercase, no trailing dot, and the port in decimal without
-/// leading zeros. The port is left out if it is 443, and a URL may also leave
-/// out (or spell out) the default port of its own scheme.
+/// leading zeros. The port is left out if it is 443: an upstream is always
+/// reached over https, and URLs of any other scheme are rejected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Source {
     /// A model repository on a Hugging Face compatible hub.
@@ -108,8 +108,12 @@ impl Reference {
             parse_hf(rest).map(Self::from)
         } else if let Some(rest) = input.strip_prefix("civitai:") {
             parse_civitai(rest, defaults).map(Self::from)
-        } else if let Some((default_port, rest)) = strip_scheme(input) {
-            parse_url(rest, default_port)
+        } else if let Some((scheme, rest)) = input.split_once("://") {
+            if scheme.eq_ignore_ascii_case("https") {
+                parse_url(rest)
+            } else {
+                Err(format!("only https URLs are supported, not {scheme}"))
+            }
         } else {
             Err("expected hf:<org>/<repo>, civitai:<host>:<modelId>@<versionId> or a URL".into())
         };
@@ -133,7 +137,7 @@ impl From<Source> for Reference {
 
 fn parse_hf(rest: &str) -> Result<Source, Reason> {
     let (host, repo) = match rest.rsplit_once(':') {
-        Some((host, repo)) => (normalize_host(host, HTTPS_PORT)?, repo),
+        Some((host, repo)) => (normalize_host(host)?, repo),
         None => (DEFAULT_HF_HOST.to_owned(), rest),
     };
     let segments: Vec<&str> = repo.split('/').collect();
@@ -151,9 +155,9 @@ fn parse_hf(rest: &str) -> Result<Source, Reason> {
 
 fn parse_civitai(rest: &str, defaults: &Defaults) -> Result<Source, Reason> {
     let (host, ids) = match rest.rsplit_once(':') {
-        Some((host, ids)) => (normalize_host(host, HTTPS_PORT)?, ids),
+        Some((host, ids)) => (normalize_host(host)?, ids),
         None => match &defaults.civitai_host {
-            Some(host) => (normalize_host(host, HTTPS_PORT)?, rest),
+            Some(host) => (normalize_host(host)?, rest),
             None => return Err("no host given and no default civitai host is configured".into()),
         },
     };
@@ -171,24 +175,11 @@ fn parse_civitai(rest: &str, defaults: &Defaults) -> Result<Source, Reason> {
     })
 }
 
-/// The default port of the scheme and the part after `://`, if `input` is an
-/// http(s) URL.
-fn strip_scheme(input: &str) -> Option<(u16, &str)> {
-    let (scheme, rest) = input.split_once("://")?;
-    if scheme.eq_ignore_ascii_case("https") {
-        Some((HTTPS_PORT, rest))
-    } else if scheme.eq_ignore_ascii_case("http") {
-        Some((HTTP_PORT, rest))
-    } else {
-        None
-    }
-}
-
-fn parse_url(rest: &str, default_port: u16) -> Result<Reference, Reason> {
+fn parse_url(rest: &str) -> Result<Reference, Reason> {
     let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = normalize_host(authority, default_port)?;
+    let host = normalize_host(authority)?;
     let segments = path
         .split('/')
         .filter(|segment| !segment.is_empty())
@@ -284,10 +275,7 @@ fn decode_segment(segment: &str) -> Result<String, Reason> {
 
 /// Reduces a `host[:port]` to its one spelling (see [`Source`]) and checks
 /// that it only has characters that are safe in a directory name.
-///
-/// `default_port` is the default port of the scheme the host was written
-/// with; it is dropped like 443 is.
-fn normalize_host(host: &str, default_port: u16) -> Result<String, Reason> {
+fn normalize_host(host: &str) -> Result<String, Reason> {
     let invalid = || format!("invalid host {host:?}");
     let lower = host.to_ascii_lowercase();
     let (name, port) = match lower.split_once(':') {
@@ -311,7 +299,7 @@ fn normalize_host(host: &str, default_port: u16) -> Result<String, Reason> {
         None => None,
     };
     match port {
-        Some(port) if port != HTTPS_PORT && port != default_port => Ok(format!("{name}:{port}")),
+        Some(port) if port != HTTPS_PORT => Ok(format!("{name}:{port}")),
         _ => Ok(name.to_owned()),
     }
 }
@@ -488,7 +476,7 @@ mod tests {
         assert_eq!(pinned.source, civitai("example.com", 12345, Some(67890)));
         assert_eq!(pinned.file_id, Some(111));
 
-        let with_port = parse("http://127.0.0.1:8080/models/1?modelVersionId=2").unwrap();
+        let with_port = parse("https://127.0.0.1:8080/models/1?modelVersionId=2").unwrap();
         assert_eq!(with_port.source, civitai("127.0.0.1:8080", 1, Some(2)));
     }
 
@@ -516,11 +504,6 @@ mod tests {
             ),
             (
                 "https://hub.example.com:0443/example-model",
-                "hub.example.com",
-            ),
-            ("http://hub.example.com:80/example-model", "hub.example.com"),
-            (
-                "http://hub.example.com:443/example-model",
                 "hub.example.com",
             ),
             (
@@ -564,6 +547,8 @@ mod tests {
             "",
             "example-org/example-model",
             "ftp://example.com/models/1",
+            "http://example.com/models/1",
+            "http://hub.example.com:443/example-org/example-model",
             "hf:",
             "hf:a/b/c",
             "hf:../example-model",
@@ -598,6 +583,16 @@ mod tests {
         ] {
             assert!(parse(input).is_err(), "{input:?}");
         }
+    }
+
+    #[test]
+    fn only_https_urls_are_accepted() {
+        let err = parse("http://hub.example.com/example-org/example-model").unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("only https URLs are supported, not http"),
+            "{err}"
+        );
     }
 
     #[test]
