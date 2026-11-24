@@ -81,11 +81,22 @@ pub(super) struct GcArgs {
     /// Only show what would be removed
     #[arg(short = 'n', long)]
     dry_run: bool,
+    /// Keep blobs whose last link went away more recently than this, such
+    /// as 12h or 7d
+    #[arg(long, value_name = "AGE", default_value = "1d", value_parser = crate::gc::parse_duration)]
+    min_age: std::time::Duration,
 }
 
 pub(super) fn gc(args: &GcArgs, context: &mut Context<'_>) -> Result<()> {
     let workspace = open(context)?;
-    let collected = crate::node::gc::gc(&workspace, args.dry_run)?;
+    let collected = crate::node::gc::gc(&workspace, args.min_age, args.dry_run)?;
+    for path in &collected.strays {
+        let _ = writeln!(
+            context.err,
+            "warning: {} is not a blob at its place; left alone",
+            path.display()
+        );
+    }
     let sizes: Vec<u64> = collected.blobs.iter().map(|(_, size)| *size).collect();
     super::report_gc(context, args.dry_run, &sizes, collected.partials.len())
 }

@@ -847,12 +847,23 @@ fn gc_removes_blobs_of_files_that_were_pruned() {
     );
 
     fs::remove_file(workspace.join("x/config.json")).unwrap();
-    let would = run_in(&upstream, &workspace, &[], &["gc", "--dry-run"]);
+    // The last link went away just now: kept for a day by default.
+    let recent = run_in(&upstream, &workspace, &[], &["gc"]);
+    assert_eq!(
+        recent.out,
+        "removed 0 blob(s) (0 B), 0 unfinished download(s)\n"
+    );
+    let would = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["gc", "--dry-run", "--min-age", "0"],
+    );
     assert_eq!(
         would.out,
         "would remove 1 blob(s) (2 B), 0 unfinished download(s)\n"
     );
-    let removed = run_in(&upstream, &workspace, &[], &["gc"]);
+    let removed = run_in(&upstream, &workspace, &[], &["gc", "--min-age", "0"]);
     assert_eq!(
         removed.out,
         "removed 1 blob(s) (2 B), 0 unfinished download(s)\n"
