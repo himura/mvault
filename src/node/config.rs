@@ -74,7 +74,7 @@ impl Config {
                 // from the workspace, like `blobs`. The settings of the node
                 // serve every workspace, so there it has no meaning.
                 let is_path = !mirror.contains("://");
-                if is_path && Path::new(&mirror).is_relative() && !mirror.is_empty() {
+                if is_path && !Path::new(&mirror).has_root() && !mirror.is_empty() {
                     if !local {
                         return Err(invalid(format!(
                             "mirror {mirror:?} is a relative path; give an absolute one"

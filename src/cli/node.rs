@@ -117,7 +117,7 @@ pub(super) fn init(args: &InitArgs, context: &mut Context<'_>) -> Result<()> {
         .iter()
         .map(|mirror| {
             let is_path = !mirror.contains("://");
-            if is_path && !mirror.is_empty() && std::path::Path::new(mirror).is_relative() {
+            if is_path && !mirror.is_empty() && !std::path::Path::new(mirror).has_root() {
                 context.cwd.join(mirror).to_string_lossy().into_owned()
             } else {
                 mirror.clone()
