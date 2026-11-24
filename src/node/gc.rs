@@ -262,14 +262,14 @@ mod tests {
         fs::hard_link(&blob, &left).unwrap();
 
         let would = gc(&workspace, Duration::ZERO, true).unwrap();
-        assert_eq!(would.links, [left.clone()]);
+        assert_eq!(would.links, std::slice::from_ref(&left));
         // The link keeps the blob until it is gone.
         assert_eq!(would.blobs, Vec::<(PathBuf, u64)>::new());
         assert!(left.exists());
 
         assert_eq!(
             gc(&workspace, Duration::ZERO, false).unwrap().links,
-            [left.clone()]
+            std::slice::from_ref(&left)
         );
         assert!(!left.exists());
         assert_eq!(
