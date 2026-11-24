@@ -3,7 +3,8 @@
 //! ```text
 //! <workspace>/mvault.toml    manifest       (version controlled)
 //! <workspace>/mvault.lock    lock file      (version controlled)
-//! <workspace>/.mvault/       blobs/, tmp/, config.toml   (this node only)
+//! <workspace>/.mvault/       blobs/, tmp/, placed.json, lock, config.toml
+//!                            (this node only)
 //! ```
 
 use std::fs;
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::config::Config;
 use super::manifest::{LOCK_NAME, MANIFEST_NAME, STATE_DIR};
+use super::placed::PLACED_NAME;
 use super::remote::Remote;
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, write_atomic};
@@ -80,6 +82,77 @@ impl Workspace {
         self.root.join(LOCK_NAME)
     }
 
+    /// The path of the record of placed files.
+    #[must_use]
+    pub fn placed_path(&self) -> PathBuf {
+        self.root.join(STATE_DIR).join(PLACED_NAME)
+    }
+
+    /// Waits for the lock that lets one command at a time change the
+    /// workspace, and holds it until the returned file is dropped.
+    ///
+    /// Without `create`, for a command that changes nothing, the lock file
+    /// is not created: if there is none, no command changing the workspace
+    /// has ever run, and `None` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock file cannot be created or locked.
+    pub fn lock(&self, create: bool) -> Result<Option<fs::File>> {
+        let state = self.root.join(STATE_DIR);
+        let path = state.join(WORKSPACE_LOCK);
+        if create {
+            fs::create_dir_all(&state).map_err(io_error(&state))?;
+        }
+        let file = fs::File::options()
+            .create(create)
+            .truncate(false)
+            .write(true)
+            .open(&path);
+        let file = match file {
+            Ok(file) => file,
+            Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(io_error(&path)(error)),
+        };
+        if create {
+            file.lock().map_err(io_error(&path))?;
+        } else {
+            file.lock_shared().map_err(io_error(&path))?;
+        }
+        Ok(Some(file))
+    }
+
+    /// Checks that no destination is inside the blobs or the directory of
+    /// unfinished files: placing or pruning there would change the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the first such destination.
+    pub fn check_dests<'a>(&self, dests: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let blobs = normalize(
+            &self
+                .store
+                .blob_path(&crate::hash::Sha256::from_bytes([0; 32])),
+        );
+        // `<blobs>/sha256/00/<digest>`, three levels below the blobs.
+        let blobs = blobs.ancestors().nth(3).unwrap_or(&blobs).to_owned();
+        let tmp = normalize(self.store.tmp_dir());
+        for dest in dests {
+            let path = normalize(&self.root.join(dest));
+            if path.starts_with(&blobs) || path.starts_with(&tmp) {
+                return Err(Error::Invalid(format!(
+                    "{dest} is inside the blobs of this node ({} and {}); \
+                     move the blobs or the destination",
+                    blobs.display(),
+                    tmp.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The hosts to assume for sources of the manifest that name none.
     #[must_use]
     pub fn defaults(&self) -> Defaults {
@@ -100,6 +173,27 @@ impl Workspace {
             .map(|location| Remote::parse(location))
             .collect()
     }
+}
+
+/// Name of the lock file of a workspace, in its state directory.
+const WORKSPACE_LOCK: &str = "lock";
+
+/// `path` without `.` and with `..` taken away where it can be, without
+/// asking the filesystem.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normal.pop() {
+                    normal.push("..");
+                }
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
 }
 
 /// Makes `dir` a workspace: creates the manifest and the directory for this

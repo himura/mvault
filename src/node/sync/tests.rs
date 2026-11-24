@@ -7,6 +7,7 @@ use crate::download::{Client, RetryPolicy};
 use crate::mirror::exclude::Excludes;
 use crate::mirror::{CivitaiPull, HfPull, Mirror, Selection};
 use crate::node::manifest::{LOCK_NAME, MANIFEST_NAME};
+use crate::node::placed::{Placed, Stamp};
 use crate::node::remote::Remote;
 use crate::testutil::{Routes, serve_dir};
 use crate::upstream::civitai::Site;
@@ -490,19 +491,30 @@ fn a_managed_file_is_replaced_when_the_manifest_changes() {
 }
 
 #[test]
-fn prune_removes_managed_files_only() {
+fn prune_removes_recorded_files_only() {
     let world = World::new();
     world.manifest(REPO_ENTRY);
     world.sync(Options::default()).unwrap();
     fs::write(world.root().join("models/x/notes.txt"), b"mine").unwrap();
     // The same size as a blob, but not a link to one.
     fs::write(world.root().join("models/x/copy.json"), b"{}").unwrap();
+    // A link to a blob that mvault did not place: not in the record.
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    fs::hard_link(
+        workspace.store.blob_path(&Sha256::of(b"{}")),
+        world.root().join("models/x/linked-by-hand.json"),
+    )
+    .unwrap();
 
     world.manifest(&format!(
         "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"config.json\", dest = \"models/x/renamed.json\" }}]\n"
     ));
     let without = world.sync(Options::default()).unwrap();
     assert_eq!((without.linked, without.pruned), (1, 0));
+    assert_eq!(
+        without.dropped,
+        ["models/vae/x_vae.safetensors", "models/x/config.json"]
+    );
     assert!(world.exists("models/x/config.json"));
 
     let dry = world
@@ -512,7 +524,7 @@ fn prune_removes_managed_files_only() {
             ..Options::default()
         })
         .unwrap();
-    assert_eq!(dry.pruned, 1);
+    assert_eq!(dry.pruned, 2);
     assert!(world.exists("models/x/config.json"));
 
     let (result, events, _) = world.sync_with(
@@ -522,14 +534,205 @@ fn prune_removes_managed_files_only() {
             ..Options::default()
         },
     );
-    assert_eq!(result.unwrap().pruned, 1);
-    assert_eq!(events, ["Pruned(\"models/x/config.json\")"]);
+    assert_eq!(result.unwrap().pruned, 2);
+    assert_eq!(
+        events,
+        [
+            "Pruned(\"models/vae/x_vae.safetensors\")",
+            "Pruned(\"models/x/config.json\")"
+        ]
+    );
     assert!(!world.exists("models/x/config.json"));
+    assert!(!world.exists("models/vae/x_vae.safetensors"));
     assert_eq!(world.read("models/x/renamed.json"), b"{}");
     assert_eq!(world.read("models/x/notes.txt"), b"mine");
     assert_eq!(world.read("models/x/copy.json"), b"{}");
-    // Outside the directories the manifest places into, nothing is touched.
+    assert_eq!(world.read("models/x/linked-by-hand.json"), b"{}");
+    // The blobs stay: putting the files back in the manifest fetches nothing.
+    assert!(workspace.store.contains(&Sha256::of(b"weights")));
+    let record = Placed::load(&workspace.placed_path()).unwrap();
+    let recorded: Vec<&str> = record.iter().map(|(dest, _)| dest).collect();
+    assert_eq!(recorded, ["models/x/renamed.json"]);
+}
+
+#[test]
+fn files_placed_before_the_record_existed_are_not_pruned() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    world.sync(Options::default()).unwrap();
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    fs::remove_file(workspace.placed_path()).unwrap();
+
+    world.manifest("");
+    let report = world
+        .sync(Options {
+            prune: true,
+            ..Options::default()
+        })
+        .unwrap();
+
+    assert_eq!(report.pruned, 0);
+    assert!(world.exists("models/x/config.json"));
+}
+
+#[test]
+fn every_placed_file_is_recorded_with_its_blob() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+
+    world.sync(Options::default()).unwrap();
+
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let record = Placed::load(&workspace.placed_path()).unwrap();
+    let entry = record.get("models/vae/x_vae.safetensors").unwrap();
+    assert_eq!(entry.sha256, Sha256::of(b"weights"));
+    let blob = workspace.store.blob_path(&entry.sha256);
+    assert!(Stamp::of(&blob).unwrap().unwrap().matches(entry));
+    assert_eq!(record.iter().count(), 2);
+    // No temporary link is left next to the blobs or in the workspace.
+    let tmp: Vec<_> = fs::read_dir(workspace.store.tmp_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(LINK_PREFIX))
+        .collect();
+    assert_eq!(tmp, Vec::<String>::new());
+    let names: Vec<_> = fs::read_dir(world.root().join("models/vae"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["x_vae.safetensors"]);
+}
+
+#[test]
+fn a_file_replaced_by_the_user_is_forgotten() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    world.sync(Options::default()).unwrap();
+    fs::remove_file(world.root().join("models/x/config.json")).unwrap();
+    fs::write(world.root().join("models/x/config.json"), b"mine").unwrap();
+
+    world.manifest("");
+    let report = world
+        .sync(Options {
+            prune: true,
+            ..Options::default()
+        })
+        .unwrap();
+
+    assert_eq!(report.pruned, 1);
+    assert_eq!(world.read("models/x/config.json"), b"mine");
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    assert!(Placed::load(&workspace.placed_path()).unwrap().is_empty());
+}
+
+#[cfg(unix)]
+fn overwrite_in_place(path: &Path, content: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    // What a tool running as root, or one that changes permissions first,
+    // does: write into the same inode.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(path, content).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_that_was_written_to_is_left_alone_unless_forced() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    world.sync(Options::default()).unwrap();
+    overwrite_in_place(
+        &world.root().join("models/vae/x_vae.safetensors"),
+        b"WEIGHTS",
+    );
+
+    let (result, events, _) = world.sync_with(&[Remote::Dir(world.public())], Options::default());
+
+    let report = result.unwrap();
+    assert_eq!(report.damaged, ["models/vae/x_vae.safetensors"]);
+    assert_eq!(report.unchanged, 1);
+    assert!(events.contains(&"Damaged(\"models/vae/x_vae.safetensors\")".to_owned()));
+    assert_eq!(world.read("models/vae/x_vae.safetensors"), b"WEIGHTS");
+
+    // Nor does prune remove a file whose blob was written to.
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"config.json\", dest = \"models/x/\" }}]\n"
+    ));
+    let pruned = world
+        .sync(Options {
+            prune: true,
+            ..Options::default()
+        })
+        .unwrap();
+    assert_eq!(pruned.kept, ["models/vae/x_vae.safetensors"]);
+    assert!(world.exists("models/vae/x_vae.safetensors"));
+
+    world.manifest(REPO_ENTRY);
+    let forced = world
+        .sync(Options {
+            force: true,
+            ..Options::default()
+        })
+        .unwrap();
+    assert_eq!((forced.fetched, forced.linked), (1, 1));
+    assert_eq!(forced.damaged, Vec::<String>::new());
     assert_eq!(world.read("models/vae/x_vae.safetensors"), b"weights");
+    assert!(is_link_to_blob(
+        &world,
+        "models/vae/x_vae.safetensors",
+        b"weights"
+    ));
+    assert_eq!(world.sync(Options::default()).unwrap().unchanged, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_that_was_only_touched_is_recorded_again() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    world.sync(Options::default()).unwrap();
+    overwrite_in_place(
+        &world.root().join("models/vae/x_vae.safetensors"),
+        b"weights",
+    );
+
+    let report = world.sync(Options::default()).unwrap();
+
+    assert_eq!(report.damaged, Vec::<String>::new());
+    assert_eq!(report.unchanged, 2);
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let record = Placed::load(&workspace.placed_path()).unwrap();
+    let entry = record.get("models/vae/x_vae.safetensors").unwrap();
+    let blob = workspace.store.blob_path(&entry.sha256);
+    assert!(Stamp::of(&blob).unwrap().unwrap().matches(entry));
+}
+
+#[test]
+fn a_destination_inside_the_blobs_is_rejected() {
+    let world = World::new();
+    world.settings("blobs = \"models/.blobs\"\n");
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"config.json\", dest = \"models/.blobs/sha256/x.json\" }}]\n"
+    ));
+
+    let error = world.sync(Options::default()).unwrap_err().to_string();
+
+    assert!(error.contains("inside the blobs"), "{error}");
+}
+
+#[test]
+fn a_dry_run_changes_nothing_in_the_state_directory() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+
+    world
+        .sync(Options {
+            dry_run: true,
+            ..Options::default()
+        })
+        .unwrap();
+
+    assert!(!world.exists(".mvault"));
 }
 
 #[test]
@@ -667,20 +870,4 @@ fn blobs_may_live_outside_the_workspace() {
         "models/vae/x_vae.safetensors",
         b"weights"
     ));
-}
-
-#[test]
-fn top_dirs_leave_out_nested_ones() {
-    let dests: BTreeSet<&str> = [
-        "models/vae/a",
-        "models/vae/deep/b",
-        "models/x/c",
-        "modelsx/d",
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(top_dirs(&dests), ["models/vae", "models/x", "modelsx"]);
-
-    let with_root: BTreeSet<&str> = ["top.bin", "models/vae/a"].into_iter().collect();
-    assert_eq!(top_dirs(&with_root), [""]);
 }

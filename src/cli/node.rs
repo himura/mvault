@@ -70,7 +70,8 @@ pub(super) struct SyncArgs {
     /// Remove placed files that the manifest no longer has
     #[arg(long)]
     prune: bool,
-    /// Replace files that are in the way of a model
+    /// Replace files that are in the way of a model, and fetch again blobs
+    /// that were written to
     #[arg(long)]
     force: bool,
 }
@@ -159,7 +160,16 @@ pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
                     reporter.err,
                     "conflict: {dest} exists and is not managed by mvault (--force replaces it)"
                 ),
+                Event::Damaged(dest) => writeln!(
+                    reporter.err,
+                    "damaged: the blob of {dest} was written to and no longer has its digest \
+                     (--force fetches it again)"
+                ),
                 Event::Pruned(dest) => writeln!(reporter.err, "pruned {dest}"),
+                Event::Kept(dest) => writeln!(
+                    reporter.err,
+                    "kept {dest}: its blob was written to (--force lets it go as an ordinary file)"
+                ),
             };
         })
     })?;
@@ -171,13 +181,32 @@ pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
             report.resolved, report.fetched, report.linked, report.unchanged, report.pruned
         ),
     )?;
-    if report.conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Invalid(format!(
+    if !report.dropped.is_empty() {
+        say(
+            context,
+            &format!(
+                "{} placed file(s) are no longer in the manifest (--prune removes them)",
+                report.dropped.len()
+            ),
+        )?;
+    }
+    let mut problems = Vec::new();
+    if !report.conflicts.is_empty() {
+        problems.push(format!(
             "{} destination(s) are taken by files mvault does not manage",
             report.conflicts.len()
-        )))
+        ));
+    }
+    if !report.damaged.is_empty() {
+        problems.push(format!(
+            "{} file(s) have a blob that was written to",
+            report.damaged.len()
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(problems.join("; ")))
     }
 }
 
