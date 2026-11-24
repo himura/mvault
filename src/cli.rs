@@ -75,10 +75,14 @@ struct PullArgs {
     /// Branch, tag or commit of a repository [default: main]
     #[arg(long, value_name = "REVISION")]
     revision: Option<String>,
-    /// Do not fetch the files of a repository matching this glob, or
-    /// `/regex/` (repeatable)
-    #[arg(long, value_name = "PATTERN")]
+    /// Do not fetch the files of a repository matching this glob, read as
+    /// in .gitignore (repeatable)
+    #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+    /// Do not fetch the files of a repository whose path matches this
+    /// regular expression (repeatable)
+    #[arg(long, value_name = "REGEXP")]
+    exclude_regexp: Vec<String>,
     /// Host of the upstream, for the two-word form of SOURCE
     #[arg(long, value_name = "HOST")]
     host: Option<String>,
@@ -184,7 +188,7 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
                 host,
                 repo,
                 revision,
-                excludes: &Excludes::new(&args.exclude)?,
+                excludes: &Excludes::new(&args.exclude, &args.exclude_regexp)?,
             };
             mirror.pull_hf(&context.http, &pull, &mut |event| reporter.handle(event))?
         }
@@ -193,9 +197,12 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
             model_id,
             version_id,
         } => {
-            if args.revision.is_some() || !args.exclude.is_empty() {
+            if args.revision.is_some()
+                || !args.exclude.is_empty()
+                || !args.exclude_regexp.is_empty()
+            {
                 return Err(Error::Invalid(
-                    "--revision and --exclude are for repositories, not model versions".into(),
+                    "--revision, --exclude and --exclude-regexp are for repositories, not model versions".into(),
                 ));
             }
             let mut file_ids = args.file_id.clone();

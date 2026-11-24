@@ -8,6 +8,7 @@ use super::manifest::Model;
 use super::remote::Remote;
 use crate::download::Client;
 use crate::error::{Error, Result};
+use crate::fsutil::check_relative;
 use crate::snapshot::{self, Snapshot};
 use crate::source::{Defaults, Reference, Source};
 use crate::upstream::civitai::Site;
@@ -170,6 +171,16 @@ fn read_snapshot(source: &Source, revision: &str, access: &Access<'_>) -> Option
     let content = read_first(&path, access)?;
     match serde_json::from_slice::<Snapshot>(&content) {
         Ok(snapshot) if snapshot.schema == snapshot::SCHEMA && snapshot.revision == revision => {
+            // A mirror is read over the network: a path in its snapshot
+            // must not lead a placement out of its destination.
+            if let Some(bad) = snapshot
+                .files
+                .iter()
+                .find(|file| check_relative(&file.path).is_err())
+            {
+                access.warn(format!("{path}: not usable (unsafe path {:?})", bad.path));
+                return None;
+            }
             Some(snapshot)
         }
         Ok(snapshot) => {

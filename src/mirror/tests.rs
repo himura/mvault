@@ -94,7 +94,7 @@ fn pull_hf(
     excludes: &[&str],
 ) -> Result<Pulled> {
     let hub = Hub::new(&upstream.base(), None);
-    let excludes = Excludes::new(excludes).unwrap();
+    let excludes = Excludes::new(excludes, &[] as &[&str]).unwrap();
     let pull = HfPull {
         hub: &hub,
         host: HOST,
@@ -425,7 +425,7 @@ fn hf_pull_reports_events_in_order() {
     hub_with_repo(&upstream, COMMIT, "main");
     let mut mirror = Mirror::open(dir.path()).unwrap();
     let hub = Hub::new(&upstream.base(), None);
-    let excludes = Excludes::new(&["assets"]).unwrap();
+    let excludes = Excludes::new(&["assets"], &[] as &[&str]).unwrap();
 
     let mut log = Vec::new();
     mirror

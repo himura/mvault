@@ -115,8 +115,12 @@ fn select<'a>(
 ) -> std::result::Result<Vec<(String, &'a LockedFile)>, String> {
     let mut selected = Vec::new();
     match &model.select {
-        Select::Whole { dest, exclude } => {
-            let excludes = Excludes::new(exclude).map_err(|e| e.to_string())?;
+        Select::Whole {
+            dest,
+            exclude,
+            exclude_regexp,
+        } => {
+            let excludes = Excludes::new(exclude, exclude_regexp).map_err(|e| e.to_string())?;
             for file in &locked.files {
                 if !excludes.matches(&file.path) {
                     selected.push((join(dest, &file.path), file));
@@ -278,7 +282,7 @@ mod tests {
     #[test]
     fn a_whole_repository_keeps_its_tree() {
         let placed = dests(
-            "[[model]]\nsource = \"hf:example-org/example-model\"\ndest = \"models/x\"\nexclude = [\"assets\", \"*.pth\"]\n",
+            "[[model]]\nsource = \"hf:example-org/example-model\"\ndest = \"models/x\"\nexclude = [\"/assets\"]\nexclude_regexp = ['\\.pth$']\n",
         );
         assert_eq!(
             placed,
@@ -300,7 +304,7 @@ mod tests {
             files = [
               { path = "split_files/vae/x_vae.safetensors", dest = "models/vae/" },
               { path = "README.md", dest = "docs/model-readme.md" },
-              { path = "split_files/upscaler/4x_*", dest = "models/upscale_models" },
+              { glob = "split_files/upscaler/4x_*", dest = "models/upscale_models" },
             ]"#,
         );
         assert_eq!(
@@ -383,7 +387,7 @@ mod tests {
                 "no file \"missing.bin\"",
             ),
             (
-                format!("{hf}files = [{{ path = \"*.zip\", dest = \"a/\" }}]\n"),
+                format!("{hf}files = [{{ glob = \"*.zip\", dest = \"a/\" }}]\n"),
                 "no file matches",
             ),
             (

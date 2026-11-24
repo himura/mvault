@@ -102,7 +102,7 @@ impl World {
                     host: HUB,
                     repo: REPO,
                     revision: "main",
-                    excludes: &Excludes::new(&["assets"]).unwrap(),
+                    excludes: &Excludes::new(&["assets"], &[] as &[&str]).unwrap(),
                 },
                 &mut |_| {},
             )
@@ -870,4 +870,34 @@ fn blobs_may_live_outside_the_workspace() {
         "models/vae/x_vae.safetensors",
         b"weights"
     ));
+}
+
+#[test]
+fn a_snapshot_with_a_path_leading_outside_is_not_used() {
+    let world = World::new();
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\ndest = \"models/x/\"\nexclude = [\"assets\"]\n"
+    ));
+    let path = world
+        .public()
+        .join(format!("snapshots/hf/{HUB}/{REPO}/{COMMIT}.json"));
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"config.json\"", "\"../../outside.json\"");
+    fs::write(&path, text).unwrap();
+    // config.json has no digest but in the snapshot that is not used.
+    world.settings("allow_official = true\n");
+
+    let (result, _, warnings) = world.sync_with(&[Remote::Dir(world.public())], Options::default());
+
+    // Resolved from the upstream instead.
+    result.unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("unsafe path")),
+        "{warnings:?}"
+    );
+    assert!(!world.dir.path().join("outside.json").exists());
+    assert_eq!(world.read("models/x/config.json"), b"{}");
 }

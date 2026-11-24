@@ -41,10 +41,14 @@ pub(super) struct AddArgs {
     /// (ending in `/`) or, for a single file, a file name
     #[arg(long, value_name = "PATH")]
     dest: String,
-    /// Place only the files of a repository matching this path or glob
+    /// Place only this file of a repository, its path taken as it is
     /// (repeatable)
-    #[arg(long, value_name = "PATTERN")]
+    #[arg(long, value_name = "PATH")]
     path: Vec<String>,
+    /// Place only the files of a repository matching this glob, by their
+    /// names in the directory --dest (repeatable)
+    #[arg(long, value_name = "GLOB")]
+    glob: Vec<String>,
     /// Place this file of a model version instead of the primary one
     /// (repeatable)
     #[arg(long, value_name = "ID")]
@@ -127,6 +131,7 @@ pub(super) fn add(args: &AddArgs, context: &mut Context<'_>) -> Result<()> {
         reference: &reference,
         dest: &args.dest,
         paths: &args.path,
+        globs: &args.glob,
         file_ids: &args.file_id,
         revision: args.revision.as_deref(),
         file: &args.file,

@@ -373,11 +373,11 @@ fn rejects_arguments_that_do_not_fit_the_source() {
         ),
         (
             vec!["pull", "civitai:example.com:12345", "--exclude", "x"],
-            "--revision and --exclude are for repositories",
+            "--revision, --exclude and --exclude-regexp are for repositories",
         ),
         (
             vec!["pull", "civitai:example.com:12345", "--revision", "main"],
-            "--revision and --exclude are for repositories",
+            "--revision, --exclude and --exclude-regexp are for repositories",
         ),
         (
             vec![
@@ -413,8 +413,21 @@ fn rejects_arguments_that_do_not_fit_the_source() {
             "invalid source",
         ),
         (
-            vec!["pull", "hf:example-org/example-model", "--exclude", "/(/"],
-            "invalid exclude pattern",
+            vec!["pull", "hf:example-org/example-model", "--exclude", "a["],
+            "invalid exclude glob",
+        ),
+        (
+            vec![
+                "pull",
+                "hf:example-org/example-model",
+                "--exclude-regexp",
+                "(",
+            ],
+            "invalid exclude regular expression",
+        ),
+        (
+            vec!["pull", "civitai:example.com:12345", "--exclude-regexp", "x"],
+            "--exclude-regexp are for repositories",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -613,7 +626,7 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     let workspace = mirror_and_workspace(&upstream, dir.path());
-    let add = |dest: &str, path: &str| {
+    let add = |dest: &str, key: &str, path: &str| {
         run_in(
             &upstream,
             &workspace,
@@ -623,13 +636,13 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
                 "hf:example-org/example-model",
                 "--dest",
                 dest,
-                "--path",
+                key,
                 path,
             ],
         )
     };
 
-    add("models/x/", "config.json").result.unwrap();
+    add("models/x/", "--path", "config.json").result.unwrap();
     fs::create_dir_all(workspace.join("models/x")).unwrap();
     fs::write(workspace.join("models/x/config.json"), b"mine").unwrap();
     let conflict = run_in(&upstream, &workspace, &[], &["sync"]);
@@ -653,7 +666,7 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
         b"{}"
     );
 
-    add("models/assets/", "assets/*").result.unwrap();
+    add("models/assets/", "--glob", "assets/*").result.unwrap();
     let missing = run_in(&upstream, &workspace, &[], &["sync"]);
     let error = missing.result.unwrap_err().to_string();
     assert!(
