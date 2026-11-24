@@ -91,7 +91,7 @@ impl World {
             dir: tempfile::tempdir().unwrap(),
             upstream,
         };
-        let mut mirror = Mirror::open(&world.mirror_root()).unwrap();
+        let mut mirror = Mirror::create(&world.mirror_root()).unwrap().0;
         let hub = Hub::new(&base, None);
         let site = Site::new(&base, None);
         mirror

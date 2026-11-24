@@ -14,10 +14,10 @@ use std::time::Duration;
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, lock_file, write_atomic};
-use crate::gc::{PARTIAL_MAX_AGE, clean_tmp};
+use crate::gc::{PARTIAL_MAX_AGE, blob_at, clean_tmp};
 use crate::hash::Sha256;
 use crate::snapshot::{self, Snapshot, SnapshotFile};
-use crate::source::Source;
+use crate::source::{Defaults, Reference, Source};
 use crate::store::BlobStore;
 use crate::upstream::civitai::Site;
 use crate::upstream::hf::Hub;
@@ -75,6 +75,9 @@ pub enum Event<'a> {
     Progress(Progress),
     /// Work on the file last started is done.
     Finished(Outcome),
+    /// Work on the file last started failed; the pull goes on with the
+    /// next one.
+    Failed(&'a str),
     /// Something went wrong that does not stop the pull.
     Warning(&'a str),
 }
@@ -92,7 +95,8 @@ pub struct Pulled {
     pub reused: usize,
     /// Files an earlier pull had fetched.
     pub present: usize,
-    /// Files of the snapshot that this pull left out.
+    /// Files of the snapshot that are not fetched after this pull: left
+    /// out, or failed.
     pub skipped: usize,
 }
 
@@ -160,20 +164,43 @@ struct Job<'a> {
 }
 
 impl Mirror {
-    /// Opens the mirror at `root`, creating what is missing.
+    /// Makes `root` a mirror, or opens the mirror that is there. Returns
+    /// whether it was created.
     ///
     /// # Errors
     ///
     /// Returns an error if the directories or the database cannot be
     /// created or opened.
+    pub fn create(root: &Path) -> Result<(Self, bool)> {
+        let created = !db_path(root).is_file();
+        for dir in [root.join("public"), root.join("private")] {
+            fs::create_dir_all(&dir).map_err(io_error(&dir))?;
+        }
+        Ok((Self::at(root)?, created))
+    }
+
+    /// Opens the mirror at `root`. Nothing is created: a mistyped root is
+    /// an error, not a new, empty mirror.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no mirror at `root`, or its database
+    /// cannot be opened.
     pub fn open(root: &Path) -> Result<Self> {
+        if !db_path(root).is_file() {
+            return Err(Error::Invalid(format!(
+                "{} is not a mirror (no private/mvault.db); mvault mirror init creates one",
+                root.display()
+            )));
+        }
+        Self::at(root)
+    }
+
+    fn at(root: &Path) -> Result<Self> {
         let public = root.join("public");
         let private = root.join("private");
-        for dir in [&public, &private] {
-            fs::create_dir_all(dir).map_err(io_error(dir))?;
-        }
         Ok(Self {
-            db: Db::open(&private.join("mvault.db"))?,
+            db: Db::open(&db_path(root))?,
             store: BlobStore::new(public.join("blobs"), private.join("tmp")),
             public,
         })
@@ -251,7 +278,7 @@ impl Mirror {
                 url: hub.file_url(repo, &commit, &file.path),
             })
             .collect();
-        let mut pulled = Pulled::new(source, commit, files.len() - jobs.len());
+        let mut pulled = Pulled::new(source, commit);
         let result = self
             .fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
                 hub.headers_for(url)
@@ -266,8 +293,9 @@ impl Mirror {
                 }
             });
 
-        // Also after a failure: what was fetched before it is worth serving.
-        self.export(snapshot_id, &origin, &pulled)?;
+        // Also after a failure: what was fetched is worth serving.
+        self.export(snapshot_id, &origin, &pulled.revision)?;
+        pulled.skipped = self.not_fetched(snapshot_id)?;
         result.map(|()| pulled)
     }
 
@@ -370,7 +398,7 @@ impl Mirror {
                 })
             })
             .collect();
-        let mut pulled = Pulled::new(source, revision, files.len() - jobs.len());
+        let mut pulled = Pulled::new(source, revision);
         let result = self
             .fetch_all(http, snapshot_id, &jobs, &mut pulled, on_event, &|url| {
                 site.headers_for(url)
@@ -383,10 +411,22 @@ impl Mirror {
                 }
             });
 
-        self.export(snapshot_id, &origin, &pulled)?;
+        self.export(snapshot_id, &origin, &pulled.revision)?;
+        pulled.skipped = self.not_fetched(snapshot_id)?;
         result.map(|()| pulled)
     }
 
+    fn not_fetched(&self, snapshot_id: i64) -> Result<usize> {
+        Ok(self
+            .db
+            .snapshot_files(snapshot_id)?
+            .iter()
+            .filter(|file| !file.fetched)
+            .count())
+    }
+
+    /// Fetches the files of `jobs`. A file that fails does not stop the
+    /// others; the failures are reported together at the end.
     fn fetch_all<'h>(
         &mut self,
         http: &Client,
@@ -397,6 +437,7 @@ impl Mirror {
         headers_for: &dyn Fn(&str) -> Vec<(&'h str, &'h str)>,
     ) -> Result<()> {
         let identity = format!("{}@{}", pulled.source, pulled.revision);
+        let mut failures = Vec::new();
         for (index, job) in jobs.iter().enumerate() {
             on_event(Event::Started {
                 index: index + 1,
@@ -407,7 +448,15 @@ impl Mirror {
                 Outcome::Present
             } else {
                 let headers = headers_for(&job.url);
-                self.fetch(http, snapshot_id, &identity, job, &headers, on_event)?
+                match self.fetch(http, snapshot_id, &identity, job, &headers, on_event) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let message = error.to_string();
+                        on_event(Event::Failed(&message));
+                        failures.push(format!("{}: {message}", job.file.path));
+                        continue;
+                    }
+                }
             };
             match outcome {
                 Outcome::Downloaded => pulled.downloaded += 1,
@@ -416,7 +465,16 @@ impl Mirror {
             }
             on_event(Event::Finished(outcome));
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!(
+                "{} of {} file(s) could not be fetched:\n  {}",
+                failures.len(),
+                jobs.len(),
+                failures.join("\n  ")
+            )))
+        }
     }
 
     /// Makes the content of one file a blob of the mirror.
@@ -450,6 +508,10 @@ impl Mirror {
         {
             // Another process fetched it while this one waited for the lock.
             return Ok(Outcome::Reused);
+        }
+        if self.db.is_fetched(snapshot_id, file.key())? {
+            // The same, for a file whose digest was not announced.
+            return Ok(Outcome::Present);
         }
 
         if announced.is_none() {
@@ -553,16 +615,26 @@ impl Mirror {
                 .forget_blobs(&gone, |digest| !store.contains(digest))?;
             // A pull stored the blob again in the meantime.
             missing.retain(|blob| forgotten.contains(&blob.sha256));
+            // Nodes read from the snapshot files which files are fetched.
+            let changed: std::collections::BTreeSet<&str> = missing
+                .iter()
+                .flat_map(|blob| blob.snapshots.iter().map(String::as_str))
+                .collect();
+            for (id, source, revision) in self.db.snapshots()? {
+                if changed.contains(format!("{source}@{revision}").as_str()) {
+                    self.export(id, &parse_source(&source)?, &revision)?;
+                }
+            }
         }
         let known = self.db.blob_digests()?;
+        let store = &self.store;
         let untracked = store
             .blob_files()
             .map_err(Error::Store)?
             .into_iter()
             .filter(|path| {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                name.parse()
-                    .map_or(true, |digest: Sha256| known.binary_search(&digest).is_err())
+                // Only a file at the place of its digest is that blob.
+                blob_at(store, path).is_none_or(|digest| known.binary_search(&digest).is_err())
             })
             .collect();
         Ok(Collected {
@@ -573,14 +645,31 @@ impl Mirror {
         })
     }
 
+    /// Writes the files of every snapshot for nodes again, from the
+    /// database. Returns how many snapshots were written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read or a file cannot be
+    /// written.
+    pub fn export_all(&self) -> Result<usize> {
+        let snapshots = self.db.snapshots()?;
+        for (id, source, revision) in &snapshots {
+            self.export(*id, &parse_source(source)?, revision)?;
+        }
+        Ok(snapshots.len())
+    }
+
     /// Writes the files nodes resolve a model from: the snapshot, and the
-    /// names that stand for revisions of the source.
-    fn export(&self, snapshot_id: i64, origin: &Source, pulled: &Pulled) -> Result<()> {
+    /// names that stand for revisions of the source. Every command that
+    /// changes what a snapshot has fetched calls this when it is done.
+    fn export(&self, snapshot_id: i64, origin: &Source, revision: &str) -> Result<()> {
+        let source = origin.to_string();
         let files = self.db.snapshot_files(snapshot_id)?;
         let document = Snapshot {
             schema: snapshot::SCHEMA,
-            source: pulled.source.clone(),
-            revision: pulled.revision.clone(),
+            source: source.clone(),
+            revision: revision.to_owned(),
             files: files
                 .into_iter()
                 .map(|file| SnapshotFile {
@@ -598,12 +687,10 @@ impl Mirror {
             .map_err(|e| Error::Invalid(format!("cannot write snapshot: {e}")))?;
         json.push(b'\n');
         write_atomic(
-            &self
-                .public
-                .join(snapshot::snapshot_path(origin, &pulled.revision)),
+            &self.public.join(snapshot::snapshot_path(origin, revision)),
             &json,
         )?;
-        for (name, target) in self.db.refs(&pulled.source)? {
+        for (name, target) in self.db.refs(&source)? {
             write_atomic(
                 &self.public.join(snapshot::ref_path(origin, &name)),
                 format!("{target}\n").as_bytes(),
@@ -614,16 +701,27 @@ impl Mirror {
 }
 
 impl Pulled {
-    fn new(source: String, revision: String, skipped: usize) -> Self {
+    fn new(source: String, revision: String) -> Self {
         Self {
             source,
             revision,
             downloaded: 0,
             reused: 0,
             present: 0,
-            skipped,
+            skipped: 0,
         }
     }
+}
+
+fn db_path(root: &Path) -> PathBuf {
+    root.join("private").join("mvault.db")
+}
+
+/// The source a snapshot of the database names.
+fn parse_source(source: &str) -> Result<Source> {
+    Reference::parse(source, &Defaults::default())
+        .map(|reference| reference.source)
+        .map_err(|e| Error::Invalid(format!("database: {e}")))
 }
 
 /// The name of the partial file for a download: the digest if it is known,

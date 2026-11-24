@@ -393,6 +393,38 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Every snapshot, as its id, source and revision, ordered by source
+    /// and revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn snapshots(&self) -> Result<Vec<(i64, String, String)>> {
+        let mut select = self
+            .conn
+            .prepare("SELECT id, source, revision FROM snapshots ORDER BY source, revision")?;
+        let rows = select.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether a file of a snapshot is fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn is_fetched(&self, snapshot_id: i64, file: FileKey<'_>) -> Result<bool> {
+        let fetched: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT fetched FROM snapshot_files
+                 WHERE snapshot_id = ?1 AND path = ?2 AND file_id = ?3",
+                params![snapshot_id, file.path, file.file_id.unwrap_or(0)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(fetched.unwrap_or(false))
+    }
+
     /// The digest of every blob the database knows, ordered.
     ///
     /// # Errors

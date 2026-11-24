@@ -89,7 +89,9 @@ struct Run {
     hosts: Vec<String>,
 }
 
+/// Runs `mvault mirror --root <root> <args>`, on a mirror made beforehand.
 fn run(upstream: &Upstream, root: &Path, env: &[(&str, &str)], args: &[&str]) -> Run {
+    crate::mirror::Mirror::create(root).unwrap();
     let mut command = vec!["mirror", "--root", root.to_str().unwrap()];
     command.extend(args);
     run_in(upstream, &std::env::temp_dir(), env, &command)
@@ -888,4 +890,42 @@ fn gc_removes_blobs_of_files_that_were_pruned() {
         synced.out,
         "0 resolved, 1 fetched, 1 linked, 0 unchanged, 0 pruned (done)\n"
     );
+}
+
+#[test]
+fn mirror_commands_other_than_init_need_a_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let root = dir.path().join("typo");
+    let mirror = |args: &[&str]| {
+        let mut command = vec!["mirror", "--root", root.to_str().unwrap()];
+        command.extend(args);
+        run_in(&upstream, dir.path(), &[], &command)
+    };
+
+    for args in [
+        &["gc"][..],
+        &["gc", "-n"],
+        &["export"],
+        &["pull", "hf:example-org/example-model"],
+    ] {
+        let error = mirror(args).result.unwrap_err().to_string();
+        assert!(error.contains("is not a mirror"), "{args:?}: {error}");
+        assert!(!root.exists(), "{args:?}");
+    }
+
+    let init = mirror(&["init"]);
+    init.result.unwrap();
+    assert_eq!(
+        init.out,
+        format!("created a mirror in {}\n", root.display())
+    );
+    let again = mirror(&["init"]);
+    assert_eq!(
+        again.out,
+        format!("{} is already a mirror\n", root.display())
+    );
+    let export = mirror(&["export"]);
+    export.result.unwrap();
+    assert_eq!(export.out, "wrote 0 snapshot(s)\n");
 }

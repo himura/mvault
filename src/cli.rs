@@ -49,8 +49,12 @@ struct MirrorArgs {
 
 #[derive(Debug, Subcommand)]
 enum MirrorCommand {
+    /// Make a directory a mirror
+    Init,
     /// Fetch a repository or a model version from its upstream
     Pull(PullArgs),
+    /// Write the files nodes read again, from the database of the mirror
+    Export,
     /// Remove the blobs no snapshot uses, and unfinished downloads
     Gc(MirrorGcArgs),
 }
@@ -135,7 +139,13 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
             match mirror.command {
+                MirrorCommand::Init => mirror_init(&root, context),
                 MirrorCommand::Pull(args) => pull(&root, &args, context),
+                MirrorCommand::Export => {
+                    let count = Mirror::open(&root)?.export_all()?;
+                    writeln!(context.out, "wrote {count} snapshot(s)")
+                        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+                }
                 MirrorCommand::Gc(args) => mirror_gc(&root, &args, context),
             }
         }
@@ -245,6 +255,17 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
         "{source}@{revision}: {downloaded} downloaded, {reused} reused, {present} already present, {skipped} not fetched"
     )
     .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+fn mirror_init(root: &std::path::Path, context: &mut Context<'_>) -> Result<()> {
+    let (_, created) = Mirror::create(root)?;
+    let message = if created {
+        format!("created a mirror in {}", root.display())
+    } else {
+        format!("{} is already a mirror", root.display())
+    };
+    writeln!(context.out, "{message}")
+        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
 }
 
 fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<'_>) -> Result<()> {
@@ -363,6 +384,7 @@ impl Reporter<'_> {
                 Outcome::Reused => "reused",
                 Outcome::Present => "already present",
             }),
+            Event::Failed(message) => self.end(&format!("failed: {message}")),
             Event::Warning(message) => writeln!(self.err, "warning: {message}"),
         }
     }
