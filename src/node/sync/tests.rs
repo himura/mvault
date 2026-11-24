@@ -573,6 +573,33 @@ fn a_file_without_a_digest_is_fetched_once_for_two_places() {
 }
 
 #[test]
+fn a_partial_file_without_a_digest_is_not_continued() {
+    let world = World::new();
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"config.json\", dest = \"a/\" }}]\n"
+    ));
+    world.settings("allow_official = true\n");
+    // Left by an earlier run, perhaps of a version replaced since.
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let key = Sha256::of(format!("hf:{HUB}:{REPO}\0{COMMIT}\0config.json\00").as_bytes());
+    let partial = workspace.store.partial_path(&key.to_string()).unwrap();
+    fs::write(&partial, b"{").unwrap();
+
+    let (result, _, _) = world.sync_with(&[], Options::default());
+
+    result.unwrap();
+    assert_eq!(world.read("a/config.json"), b"{}");
+    let ranges: Vec<_> = world
+        .upstream
+        .server
+        .requests()
+        .iter()
+        .filter_map(|request| request.header("range").map(str::to_owned))
+        .collect();
+    assert_eq!(ranges, Vec::<String>::new());
+}
+
+#[test]
 fn a_mirror_that_fails_is_passed_over_with_a_warning() {
     let world = World::new();
     world.manifest(REPO_ENTRY);
