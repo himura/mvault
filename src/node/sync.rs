@@ -664,7 +664,7 @@ fn fetch(
         if store.contains(&digest) {
             return Ok(digest);
         }
-        for remote in access.remotes {
+        for remote in access.usable_remotes() {
             let fetched = remote.fetch_blob(access.http, &digest, &partial, &mut |progress| {
                 on_event(Event::Progress(progress));
             });
@@ -681,7 +681,7 @@ fn fetch(
                     )));
                 }
                 Ok(None) => {}
-                Err(error) => access.warn(format!("mirror {remote}: {error}")),
+                Err(error) => access.mirror_failed(remote, &error),
             }
         }
     }

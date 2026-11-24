@@ -929,3 +929,27 @@ fn mirror_commands_other_than_init_need_a_mirror() {
     export.result.unwrap();
     assert_eq!(export.out, "wrote 0 snapshot(s)\n");
 }
+
+#[test]
+fn init_writes_a_relative_mirror_as_an_absolute_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+
+    run_in(
+        &upstream,
+        dir.path(),
+        &[],
+        &["init", "mlenv", "--mirror", "vault/public"],
+    )
+    .result
+    .unwrap();
+
+    let settings = fs::read_to_string(dir.path().join("mlenv/.mvault/config.toml")).unwrap();
+    let expected = toml::Value::String(
+        dir.path()
+            .join("vault/public")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(settings, format!("mirrors = [{expected}]\n"));
+}

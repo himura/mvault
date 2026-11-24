@@ -177,6 +177,7 @@ impl World {
             hub: &|_| Hub::new(&base, None),
             site: &|_| Site::new(&base, None),
             warnings: RefCell::default(),
+            down: RefCell::default(),
         };
         let mut events = Vec::new();
         let result = sync(&workspace, &access, options, &mut |event| match event {
@@ -801,13 +802,10 @@ fn a_mirror_that_fails_is_passed_over_with_a_warning() {
     fs::remove_file(world.root().join(LOCK_NAME)).unwrap();
     let (result, _, warnings) = world.sync_with(&with_failing, Options::default());
     assert_eq!(result.unwrap().linked, 2);
-    assert_ne!(warnings, Vec::<String>::new());
-    assert!(
-        warnings
-            .iter()
-            .all(|warning| warning.contains("HTTP status 500")),
-        "{warnings:?}"
-    );
+    // Asked once, warned about once: not for every file of the run.
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("HTTP status 500"), "{warnings:?}");
+    assert_eq!(failing.requests().len(), 1);
 }
 
 #[test]
@@ -900,4 +898,23 @@ fn a_snapshot_with_a_path_leading_outside_is_not_used() {
     );
     assert!(!world.dir.path().join("outside.json").exists());
     assert_eq!(world.read("models/x/config.json"), b"{}");
+}
+
+#[test]
+fn a_mirror_that_is_not_mounted_is_not_a_mirror_without_the_file() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    let unmounted = world.dir.path().join("not-mounted");
+
+    let (result, _, warnings) = world.sync_with(
+        &[Remote::Dir(unmounted), Remote::Dir(world.public())],
+        Options::default(),
+    );
+
+    assert_eq!(result.unwrap().linked, 2);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("is the mirror mounted?"),
+        "{warnings:?}"
+    );
 }

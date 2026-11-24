@@ -2,6 +2,7 @@
 //! snapshot if one has it, from the upstream otherwise.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use super::lock::{LockedFile, LockedModel};
 use super::manifest::Model;
@@ -27,6 +28,8 @@ pub struct Access<'a> {
     /// Problems that did not stop the work, such as a mirror that could not
     /// be read while another one could.
     pub warnings: RefCell<Vec<String>>,
+    /// The mirrors that could not be read in this run.
+    pub down: RefCell<HashSet<String>>,
 }
 
 impl std::fmt::Debug for Access<'_> {
@@ -40,6 +43,23 @@ impl std::fmt::Debug for Access<'_> {
 impl Access<'_> {
     pub(crate) fn warn(&self, message: String) {
         self.warnings.borrow_mut().push(message);
+    }
+
+    /// The mirrors to try, without those that failed earlier in this run.
+    pub(crate) fn usable_remotes(&self) -> impl Iterator<Item = &Remote> {
+        self.remotes
+            .iter()
+            .filter(|remote| !self.down.borrow().contains(&remote.to_string()))
+    }
+
+    /// Notes that a mirror could not be read: it is not tried again in this
+    /// run, and warned about once.
+    pub(crate) fn mirror_failed(&self, remote: &Remote, error: &Error) {
+        if self.down.borrow_mut().insert(remote.to_string()) {
+            self.warn(format!(
+                "mirror {remote}: {error} (not tried again until the next run)"
+            ));
+        }
     }
 }
 
@@ -150,11 +170,11 @@ fn is_commit(revision: &str) -> bool {
 /// The first answer any mirror gives for `path`. A mirror that cannot be
 /// read is noted and passed over.
 fn read_first(path: &str, access: &Access<'_>) -> Option<Vec<u8>> {
-    for remote in access.remotes {
+    for remote in access.usable_remotes() {
         match remote.read(access.http, path) {
             Ok(Some(content)) => return Some(content),
             Ok(None) => {}
-            Err(error) => access.warn(format!("mirror {remote}: {error}")),
+            Err(error) => access.mirror_failed(remote, &error),
         }
     }
     None

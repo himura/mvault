@@ -110,7 +110,21 @@ pub(super) fn init(args: &InitArgs, context: &mut Context<'_>) -> Result<()> {
         Some(dir) => context.cwd.join(dir),
         None => context.cwd.clone(),
     };
-    let created = workspace::init(&dir, &args.mirror, args.allow_official)?;
+    // Written as absolute paths: the settings must mean the same from
+    // wherever mvault runs.
+    let mirrors: Vec<String> = args
+        .mirror
+        .iter()
+        .map(|mirror| {
+            let is_path = !mirror.contains("://");
+            if is_path && !mirror.is_empty() && std::path::Path::new(mirror).is_relative() {
+                context.cwd.join(mirror).to_string_lossy().into_owned()
+            } else {
+                mirror.clone()
+            }
+        })
+        .collect();
+    let created = workspace::init(&dir, &mirrors, args.allow_official)?;
     for path in &created {
         say(context, &format!("created {}", path.display()))?;
     }
@@ -263,6 +277,7 @@ fn with_access<T>(
             Site::new(&base_url(host), token)
         },
         warnings: RefCell::default(),
+        down: RefCell::default(),
     };
     let mut reporter = Reporter {
         err: &mut *context.err,

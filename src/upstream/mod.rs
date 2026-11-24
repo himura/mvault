@@ -21,7 +21,7 @@ pub(crate) fn encode_segment(value: &str) -> String {
 }
 
 /// Escapes each segment of a `/`-separated path, keeping the separators.
-fn encode_path(path: &str) -> String {
+pub(crate) fn encode_path(path: &str) -> String {
     path.split('/')
         .map(encode_segment)
         .collect::<Vec<_>>()

@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::fsutil::io_error;
 use crate::hash::{Hasher, Sha256};
 use crate::store::BlobStore;
+use crate::upstream::encode_path;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -65,11 +66,15 @@ impl Remote {
                 let file = dir.join(path);
                 match fs::read(&file) {
                     Ok(content) => Ok(Some(content)),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        check_present(dir).map(|()| None)
+                    }
                     Err(error) => Err(io_error(&file)(error)),
                 }
             }
-            Self::Http(base) => match http.get(&format!("{base}/{path}"), &[]) {
+            // A name on the mirror may hold `%` (`feature%2Fx`), which the
+            // web server would decode: each segment is escaped once more.
+            Self::Http(base) => match http.get(&format!("{base}/{}", encode_path(path)), &[]) {
                 Ok(content) => Ok(Some(content)),
                 Err(DownloadError::Status { status: 404, .. }) => Ok(None),
                 Err(error) => Err(error.into()),
@@ -96,7 +101,13 @@ impl Remote {
     ) -> Result<Option<Downloaded>> {
         let relative = BlobStore::relative_path(digest);
         match self {
-            Self::Dir(dir) => copy(&dir.join("blobs").join(relative), partial, progress),
+            Self::Dir(dir) => {
+                let copied = copy(&dir.join("blobs").join(relative), partial, progress)?;
+                if copied.is_none() {
+                    check_present(dir)?;
+                }
+                Ok(copied)
+            }
             Self::Http(base) => {
                 let hex = digest.to_string();
                 let url = format!("{base}/blobs/sha256/{}/{hex}", &hex[..2]);
@@ -121,6 +132,19 @@ impl std::fmt::Display for Remote {
             Self::Dir(dir) => write!(f, "{}", dir.display()),
             Self::Http(base) => write!(f, "{base}"),
         }
+    }
+}
+
+/// Checks that the directory of a mirror is there, so that a mirror that
+/// is not mounted is not taken for one that lacks a file.
+fn check_present(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "{} is not there (is the mirror mounted?)",
+            dir.display()
+        )))
     }
 }
 
@@ -216,7 +240,10 @@ mod tests {
     fn serve(dir: &Path) -> TestServer {
         let dir = dir.to_owned();
         TestServer::start(move |request| {
-            match fs::read(dir.join(request.path.trim_start_matches('/'))) {
+            let path = percent_encoding::percent_decode_str(request.path.trim_start_matches('/'))
+                .decode_utf8_lossy()
+                .into_owned();
+            match fs::read(dir.join(path)) {
                 Ok(content) => Response::file(request, &content),
                 Err(_) => Response::status(404),
             }
@@ -247,6 +274,36 @@ mod tests {
         );
         assert!(Remote::parse("ftp://example.com/").is_err());
         assert!(Remote::parse("").is_err());
+    }
+
+    #[test]
+    fn a_name_with_a_percent_sign_is_read_over_http_too() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("refs")).unwrap();
+        // How a mirror stores the ref `feature/x`.
+        fs::write(dir.path().join("refs/feature%2Fx"), b"abc").unwrap();
+        let server = serve(dir.path());
+        let remote = Remote::parse(&server.url("/")).unwrap();
+
+        assert_eq!(
+            remote.read(&http(), "refs/feature%2Fx").unwrap().unwrap(),
+            b"abc"
+        );
+        assert_eq!(server.requests()[0].path, "/refs/feature%252Fx");
+    }
+
+    #[test]
+    fn a_directory_that_is_not_there_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote::Dir(dir.path().join("not-mounted"));
+        let partial = dir.path().join("partial");
+
+        assert!(remote.read(&http(), "snapshots/a.json").is_err());
+        assert!(
+            remote
+                .fetch_blob(&http(), &Sha256::of(b"x"), &partial, &mut |_| {})
+                .is_err()
+        );
     }
 
     #[test]

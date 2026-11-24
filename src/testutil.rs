@@ -225,7 +225,10 @@ impl Routes {
 pub(crate) fn serve_dir(dir: &std::path::Path) -> TestServer {
     let dir = dir.to_owned();
     TestServer::start(move |request| {
-        match std::fs::read(dir.join(request.path.trim_start_matches('/'))) {
+        let path = percent_encoding::percent_decode_str(request.path.trim_start_matches('/'))
+            .decode_utf8_lossy()
+            .into_owned();
+        match std::fs::read(dir.join(path)) {
             Ok(content) => Response::file(request, &content),
             Err(_) => Response::status(404),
         }

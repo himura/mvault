@@ -311,6 +311,7 @@ mod tests {
                 hub: &|_| Hub::new(&base, None),
                 site: &|_| Site::new(&base, None),
                 warnings: RefCell::default(),
+                down: RefCell::default(),
             };
             let request = Request {
                 reference: &reference,
