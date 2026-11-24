@@ -6,7 +6,7 @@
 //! other file belongs to the user and is left alone. Which managed files may
 //! be removed is decided by the record of placed files alone.
 //!
-//! A sync first looks at the workspace and decides what to do ([`survey`]),
+//! A sync first looks at the workspace and decides what to do (`survey`),
 //! then does it. A dry run stops after the first part, so it shows what a
 //! real run would do.
 
