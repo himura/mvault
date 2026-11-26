@@ -185,6 +185,8 @@ fn parse_url(rest: &str) -> Result<Reference, Reason> {
         .filter(|segment| !segment.is_empty())
         .map(decode_segment)
         .collect::<Result<Vec<_>, _>>()?;
+    // Which segments may hold a `/` depends on where they are, so they are
+    // checked once the shape of the URL is known.
 
     // A site of the civitai kind is recognized by the shape of its model pages,
     // since no host of that kind is known in advance.
@@ -237,6 +239,12 @@ fn hf_url(host: String, segments: &[String]) -> Result<Reference, Reason> {
     for segment in repo {
         check_repo_segment(segment)?;
     }
+    if let [_, revision, path @ ..] = rest {
+        check_revision(revision)?;
+        for segment in path {
+            check_path_segment(segment)?;
+        }
+    }
     let (revision, path) = match rest {
         [] => (None, None),
         [view, revision] if view == "tree" => (Some(revision.clone()), None),
@@ -261,16 +269,35 @@ fn hf_url(host: String, segments: &[String]) -> Result<Reference, Reason> {
     })
 }
 
-/// A path segment of a URL, percent-decoded. Segments that would change the
-/// meaning of a path built from them are rejected.
+/// A path segment of a URL, percent-decoded. What the segment may contain
+/// depends on its place and is checked there.
 fn decode_segment(segment: &str) -> Result<String, Reason> {
-    let decoded = percent_decode_str(segment)
+    percent_decode_str(segment)
         .decode_utf8()
-        .map_err(|_| format!("{segment:?} is not valid UTF-8"))?;
-    if decoded == "." || decoded == ".." || decoded.contains(['/', '\\', '\0']) {
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| format!("{segment:?} is not valid UTF-8"))
+}
+
+/// Rejects a segment that would change the meaning of a path built from it.
+fn check_path_segment(segment: &str) -> Result<(), Reason> {
+    if segment == "." || segment == ".." || segment.contains(['/', '\\', '\0']) {
         return Err(format!("unsafe path segment {segment:?}"));
     }
-    Ok(decoded.into_owned())
+    Ok(())
+}
+
+/// A revision may be a ref such as `refs/pr/1`, written in a URL with its
+/// slashes percent-encoded. Each part between slashes is checked like a path
+/// segment.
+fn check_revision(revision: &str) -> Result<(), Reason> {
+    let safe = revision
+        .split('/')
+        .all(|part| !part.is_empty() && check_path_segment(part).is_ok());
+    if safe {
+        Ok(())
+    } else {
+        Err(format!("unsafe revision {revision:?}"))
+    }
 }
 
 /// Reduces a `host[:port]` to its one spelling (see [`Source`]) and checks
@@ -462,6 +489,36 @@ mod tests {
             parse("https://huggingface.co/example-model/blob/main/model.safetensors").unwrap();
         assert_eq!(no_org.source, hf("huggingface.co", "example-model"));
         assert_eq!(no_org.path.as_deref(), Some("model.safetensors"));
+    }
+
+    #[test]
+    fn a_revision_may_hold_encoded_slashes() {
+        let file = parse(
+            "https://huggingface.co/example-org/example-model/blob/refs%2Fpr%2F1/model.safetensors",
+        )
+        .unwrap();
+        assert_eq!(file.revision.as_deref(), Some("refs/pr/1"));
+        assert_eq!(file.path.as_deref(), Some("model.safetensors"));
+
+        let tree =
+            parse("https://huggingface.co/example-org/example-model/tree/refs%2Fpr%2F1").unwrap();
+        assert_eq!(tree.revision.as_deref(), Some("refs/pr/1"));
+
+        for revision in [
+            "refs%2F..%2Fx",
+            "%2Frefs",
+            "refs%2F",
+            "refs%2F%2Fpr",
+            "a%5Cb",
+            "a%00b",
+            "..",
+            ".",
+        ] {
+            let input = format!(
+                "https://huggingface.co/example-org/example-model/blob/{revision}/model.bin"
+            );
+            assert!(parse(&input).is_err(), "{input:?}");
+        }
     }
 
     #[test]
