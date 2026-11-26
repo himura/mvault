@@ -176,7 +176,7 @@ impl BlobStore {
                 .and_then(|f| f.sync_all())
                 .map_err(|e| with_path(&e, file))?;
             let dir = dest.parent().unwrap_or(&self.blobs);
-            fs::create_dir_all(dir).map_err(|e| with_path(&e, dir))?;
+            create_dir_all_synced(dir)?;
         }
         Ok(Prepared {
             file: file.to_owned(),
@@ -216,6 +216,9 @@ impl Prepared {
                 fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
                 return Ok(Committed::AlreadyPresent);
             }
+            // The file stays a partial file, which a resumed download or a
+            // second commit has to be able to open for writing.
+            let _ = make_writable(&file);
             return Err(with_path(&e, &dest));
         }
         if let Some(dir) = dest.parent() {
@@ -236,6 +239,45 @@ fn make_read_only(path: &Path) -> io::Result<()> {
     let mut permissions = fs::metadata(path)?.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
+}
+
+#[cfg(unix)]
+fn make_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(path)?.permissions().mode();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o200))
+}
+
+#[cfg(not(unix))]
+fn make_writable(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
+}
+
+/// Creates `dir` and the directories above it that are missing, and makes
+/// each new entry durable by flushing the directory that holds it. Without
+/// that, a power loss could take a new shard directory, and every blob
+/// renamed into it, with it.
+fn create_dir_all_synced(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_dir_all_synced(parent)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        // Created meanwhile by another writer, who flushes it.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(e) => return Err(with_path(&e, dir)),
+    }
+    if let Some(parent) = parent {
+        sync_dir(parent).map_err(|e| with_path(&e, parent))?;
+    }
+    Ok(())
 }
 
 /// Makes the rename into `dir` durable.
@@ -352,6 +394,38 @@ mod tests {
 
         assert_eq!(prepared.commit().unwrap(), Committed::AlreadyPresent);
         assert!(!second.exists());
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_the_file_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        let partial = write_partial(&store, "one", b"abc");
+        // A non-empty directory where the blob goes makes the rename fail.
+        let blob = store.blob_path(&digest);
+        fs::create_dir_all(blob.join("in-the-way")).unwrap();
+
+        assert!(store.commit(&partial, &digest).is_err());
+
+        assert!(!fs::metadata(&partial).unwrap().permissions().readonly());
+        fs::OpenOptions::new().append(true).open(&partial).unwrap();
+        fs::remove_dir_all(&blob).unwrap();
+        assert_eq!(store.commit(&partial, &digest).unwrap(), Committed::Added);
+    }
+
+    #[test]
+    fn commit_creates_the_missing_directories_above_the_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(
+            dir.path().join("a").join("b").join("blobs"),
+            dir.path().join("tmp"),
+        );
+        let digest = Sha256::of(b"abc");
+        let partial = write_partial(&store, "one", b"abc");
+
+        assert_eq!(store.commit(&partial, &digest).unwrap(), Committed::Added);
+        assert_eq!(fs::read(store.blob_path(&digest)).unwrap(), b"abc");
     }
 
     #[test]

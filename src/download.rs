@@ -55,8 +55,10 @@ impl RetryPolicy {
 pub struct Request<'a> {
     /// The URL of the file.
     pub url: &'a str,
-    /// Headers to send, such as `Authorization`. They are not passed on when
-    /// the server redirects to another host.
+    /// Headers to send, such as `Authorization`. On a redirect,
+    /// `Authorization` is passed on only to the same host and `Cookie` is
+    /// never passed on. Any other header follows the redirect wherever it
+    /// goes, so a secret belongs in `Authorization` only.
     pub headers: &'a [(&'a str, &'a str)],
     /// The size of the file, if it is known in advance.
     pub size: Option<u64>,
@@ -496,6 +498,13 @@ impl Client {
             if read == 0 {
                 break;
             }
+            // Stop before writing past the expected size: the server might
+            // send far more than it announced.
+            if let Some(size) = request.size
+                && target.len + read as u64 > size
+            {
+                return Err(too_long(request, target, size));
+            }
             target.append(&buffer[..read]).map_err(Failure::Fatal)?;
             progress(Progress {
                 done: target.len,
@@ -508,16 +517,20 @@ impl Client {
                 "got {} of {size} bytes",
                 target.len
             ))),
-            Some(size) if target.len > size => {
-                target.clear().map_err(Failure::Fatal)?;
-                Err(Failure::Fatal(DownloadError::TooLong {
-                    url: request.url.to_owned(),
-                    expected: size,
-                }))
-            }
             _ => Ok(()),
         }
     }
+}
+
+/// Empties `target`, which would grow past `size`, and reports it.
+fn too_long(request: &Request<'_>, target: &mut Target<'_>, size: u64) -> Failure {
+    if let Err(error) = target.clear() {
+        return Failure::Fatal(error);
+    }
+    Failure::Fatal(DownloadError::TooLong {
+        url: request.url.to_owned(),
+        expected: size,
+    })
 }
 
 fn size_mismatch(request: &Request<'_>, actual: u64) -> DownloadError {
@@ -987,6 +1000,35 @@ mod tests {
 
         assert!(matches!(error, DownloadError::Failed { .. }), "{error}");
         assert_eq!(server.requests().len(), 3);
+    }
+
+    #[test]
+    fn stops_reading_a_body_once_it_passes_the_expected_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body: Vec<u8> = (0..=255).cycle().take(3 * BUFFER_SIZE).collect();
+        // Without an announced length, the size is only found out by reading.
+        let server = TestServer::start({
+            let body = body.clone();
+            move |_| Response::ok(&body).without_length()
+        });
+
+        let mut largest = 0;
+        let request = Request {
+            url: &server.url("/file"),
+            headers: &[],
+            size: Some(4000),
+        };
+        let error = client()
+            .download(&request, &dest, &mut |p| largest = largest.max(p.done))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, DownloadError::TooLong { expected: 4000, .. }),
+            "{error}"
+        );
+        assert!(largest <= 4000, "wrote {largest} bytes");
+        assert_eq!(fs::read(&dest).unwrap(), b"");
     }
 
     #[test]
