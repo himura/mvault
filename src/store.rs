@@ -247,9 +247,9 @@ impl Prepared {
             return Ok(Committed::AlreadyPresent);
         }
         make_read_only(&file).map_err(|e| with_path(&e, &file))?;
-        if let Err(e) = fs::rename(&file, &dest) {
-            // Where a rename does not replace a read-only file, losing the
-            // race against another writer of the same blob ends up here.
+        if let Err(e) = place(&file, &dest) {
+            // Losing the race against another writer of the same blob ends
+            // up here: its blob stays as it is.
             if dest.is_file() {
                 fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
                 return Ok(Committed::AlreadyPresent);
@@ -264,6 +264,27 @@ impl Prepared {
         }
         Ok(Committed::Added)
     }
+}
+
+/// Gives `file` the name `dest`, unless something has that name already.
+///
+/// A blob stored meanwhile by another writer must not be replaced: the
+/// files placed as links to it would no longer be the blob. A hard link
+/// fails where its name is taken; the name `file` is removed afterwards.
+#[cfg(unix)]
+fn place(file: &Path, dest: &Path) -> io::Result<()> {
+    fs::hard_link(file, dest)?;
+    // The blob is in place. Were the old name left behind, it would be
+    // just another link to the blob: no download writes to a partial file
+    // whose content is stored already, and garbage collection removes it.
+    let _ = fs::remove_file(file);
+    Ok(())
+}
+
+/// Where a rename does not replace a read-only file, as a blob is.
+#[cfg(not(unix))]
+fn place(file: &Path, dest: &Path) -> io::Result<()> {
+    fs::rename(file, dest)
 }
 
 #[cfg(unix)]
@@ -432,6 +453,28 @@ mod tests {
 
         assert_eq!(prepared.commit().unwrap(), Committed::AlreadyPresent);
         assert!(!second.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placing_a_file_never_replaces_a_stored_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        store
+            .commit(&write_partial(&store, "one", b"abc"), &digest)
+            .unwrap();
+        let blob = store.blob_path(&digest);
+        let placed = dir.path().join("placed");
+        fs::hard_link(&blob, &placed).unwrap();
+        // As when another writer stores the blob after commit looked.
+        let late = write_partial(&store, "two", b"abc");
+
+        let error = place(&late, &blob).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(same_file::is_same_file(&placed, &blob).unwrap());
+        assert!(late.exists());
     }
 
     #[test]
