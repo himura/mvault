@@ -58,17 +58,30 @@ pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
 
 /// Checks that a path from outside (an API response, a command line) names a
 /// file below the directory it will be joined to.
+///
+/// It must not lead into a directory of git either: a `.git/config` placed
+/// there runs commands of its own choosing when git is run in that
+/// directory. Control characters are refused, as they would also be
+/// printed to the terminal.
 pub(crate) fn check_relative(path: &str) -> std::result::Result<(), String> {
     let safe = !path.is_empty()
-        && !path.contains(['\\', '\0'])
+        && !path.contains(['\\'])
+        && !path.chars().any(char::is_control)
         && path
             .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..");
+            .all(|part| !part.is_empty() && part != "." && part != ".." && !is_git_dir(part));
     if safe {
         Ok(())
     } else {
         Err(format!("unsafe path {path:?}"))
     }
+}
+
+/// Whether a file name is one that git takes for `.git`, on any platform:
+/// in any case, with trailing dots or spaces, or as its short DOS name.
+pub(crate) fn is_git_dir(name: &str) -> bool {
+    let name = name.trim_end_matches(['.', ' ']);
+    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
 }
 
 #[cfg(test)]
@@ -89,11 +102,37 @@ mod tests {
 
     #[test]
     fn relative_paths_stay_below_their_base() {
-        for path in ["a", "a/b.txt", "a b/c", ".gitattributes", "a/..b"] {
+        for path in [
+            "a",
+            "a/b.txt",
+            "a b/c",
+            ".gitattributes",
+            ".github/x",
+            "a/..b",
+            "a.git/b",
+        ] {
             assert!(check_relative(path).is_ok(), "{path:?}");
         }
         for path in [
-            "", "/a", "a/", "a//b", ".", "..", "a/../b", "a/./b", "a\\b", "a\0",
+            "",
+            "/a",
+            "a/",
+            "a//b",
+            ".",
+            "..",
+            "a/../b",
+            "a/./b",
+            "a\\b",
+            "a\0",
+            "a\nb",
+            "a\u{1b}[31m",
+            ".git",
+            ".git/config",
+            "models/x/.git/config",
+            ".GIT/config",
+            ".git./config",
+            ".git /config",
+            "GIT~1/config",
         ] {
             assert!(check_relative(path).is_err(), "{path:?}");
         }

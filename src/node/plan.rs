@@ -79,6 +79,14 @@ pub fn plan(manifest: &Manifest, lock: &Lock) -> Result<Vec<Placement>> {
                 size: file.size,
                 sha256: file.sha256,
             };
+            // A placed file is read-only: the manifest could not be
+            // edited, or read, any more.
+            if manifest.files.contains(&dest) {
+                return Err(Error::Invalid(format!(
+                    "{}: model {source:?} would replace the manifest file {dest}",
+                    model.file
+                )));
+            }
             if let Some(other) = placements.get(&dest)
                 && !same_file(other, &placement)
             {
@@ -371,6 +379,29 @@ mod tests {
                 pair("a/README.md", "README.md"),
                 pair("b/README.md", "README.md")
             ]
+        );
+    }
+
+    #[test]
+    fn a_file_of_the_manifest_is_not_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_NAME),
+            "include = [\"models.toml\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("models.toml"),
+            "[[model]]\nsource = \"hf:example-org/example-model\"\nfiles = [{ path = \"README.md\", dest = \"models.toml\" }]\n",
+        )
+        .unwrap();
+        let manifest = Manifest::load(dir.path(), &Defaults::default()).unwrap();
+
+        let error = plan(&manifest, &lock()).unwrap_err().to_string();
+
+        assert!(
+            error.contains("would replace the manifest file models.toml"),
+            "{error}"
         );
     }
 

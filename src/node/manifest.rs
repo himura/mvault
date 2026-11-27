@@ -10,7 +10,7 @@ use globset::GlobBuilder;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::fsutil::{check_relative, io_error};
+use crate::fsutil::{check_relative, io_error, is_git_dir};
 use crate::mirror::exclude::Excludes;
 use crate::source::{Defaults, Reference, Source};
 
@@ -29,6 +29,9 @@ pub const DEFAULT_REVISION: &str = "main";
 pub struct Manifest {
     /// The models.
     pub models: Vec<Model>,
+    /// The files of the manifest, relative to the workspace: `mvault.toml`
+    /// and the files it includes.
+    pub files: Vec<String>,
 }
 
 /// One `[[model]]` entry.
@@ -136,6 +139,7 @@ impl Manifest {
     pub fn load(workspace: &Path, defaults: &Defaults) -> Result<Self> {
         let root = read(workspace, MANIFEST_NAME)?;
         let mut models = parse_models(root.model, MANIFEST_NAME, defaults)?;
+        let mut files = vec![MANIFEST_NAME.to_owned()];
         for file in included_files(workspace, &root.include)? {
             let included = read(workspace, &file)?;
             if !included.include.is_empty() {
@@ -144,8 +148,9 @@ impl Manifest {
                 )));
             }
             models.extend(parse_models(included.model, &file, defaults)?);
+            files.push(file);
         }
-        Ok(Self { models })
+        Ok(Self { models, files })
     }
 }
 
@@ -340,6 +345,9 @@ fn parse_file(raw: RawFile, is_repo: bool) -> std::result::Result<FileSpec, Stri
 /// itself keeps there.
 pub(crate) fn check_dest(dest: &str) -> std::result::Result<(), String> {
     let path = dest.strip_suffix('/').unwrap_or(dest);
+    if path.split('/').any(is_git_dir) {
+        return Err(format!("dest {dest:?} leads into a git directory"));
+    }
     check_relative(path)
         .map_err(|_| format!("dest {dest:?} must be a path inside the workspace"))?;
     let reserved =
@@ -600,6 +608,9 @@ mod tests {
             (format!("{hf}dest = \".mvault/blobs/\"\n"), "reserved"),
             (format!("{civitai}dest = \"mvault.lock\"\n"), "reserved"),
             (format!("{hf}files = [{{ path = \"x\", dest = \"mvault.toml\" }}]\n"), "reserved"),
+            (format!("{hf}dest = \".git/\"\n"), "git directory"),
+            (format!("{hf}files = [{{ path = \"x\", dest = \"models/.Git/config\" }}]\n"), "git directory"),
+            (format!("{hf}files = [{{ path = \".git/config\", dest = \"b/\" }}]\n"), "unsafe path"),
         ] {
             let error = error_of(&manifest);
             assert!(error.contains(expected), "{manifest}\n=> {error}");
