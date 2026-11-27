@@ -522,9 +522,10 @@ impl Mirror {
         let request = Request {
             url: &job.url,
             headers,
-            // Announced sizes are compared afterwards instead: one that is
-            // wrong must fail the pull, not keep the download waiting.
-            size: None,
+            // Nothing past the announced size is written, and a server that
+            // announces another size fails before anything is read. A
+            // partial file of the announced size is complete already.
+            size: file.size,
         };
         let downloaded = http.download(&request, &partial, &mut |progress| {
             on_event(Event::Progress(progress));

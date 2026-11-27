@@ -896,16 +896,14 @@ fn a_mirror_that_fails_is_passed_over_with_a_warning() {
     assert_eq!(failing.requests().len(), 1);
 }
 
-#[test]
-fn a_blob_with_other_content_is_rejected() {
-    let world = World::new();
-    world.manifest(REPO_ENTRY);
-    // A copy of the mirror in which one blob was replaced.
+/// A copy of the mirror of `world` in which the blob of the weights has
+/// `content`.
+fn tamper(world: &World, content: &[u8]) -> PathBuf {
     let tampered = world.dir.path().join("tampered");
     let digest = Sha256::of(b"weights");
     let relative = Path::new("blobs").join(BlobStore::relative_path(&digest));
     fs::create_dir_all(tampered.join(&relative).parent().unwrap()).unwrap();
-    fs::write(tampered.join(&relative), b"tampered").unwrap();
+    fs::write(tampered.join(&relative), content).unwrap();
     for path in [
         format!("snapshots/hf/{HUB}/{REPO}/{COMMIT}.json"),
         format!("snapshots/hf/{HUB}/{REPO}/refs/main"),
@@ -913,6 +911,16 @@ fn a_blob_with_other_content_is_rejected() {
         fs::create_dir_all(tampered.join(&path).parent().unwrap()).unwrap();
         fs::copy(world.public().join(&path), tampered.join(&path)).unwrap();
     }
+    tampered
+}
+
+#[test]
+fn a_blob_with_other_content_is_rejected() {
+    let world = World::new();
+    // Of the size of the blob, so that only the digest tells.
+    let tampered = tamper(&world, b"tamperd");
+    world.manifest(REPO_ENTRY);
+    let digest = Sha256::of(b"weights");
 
     let (result, _, _) = world.sync_with(&[Remote::Dir(tampered)], Options::default());
 
@@ -923,13 +931,37 @@ fn a_blob_with_other_content_is_rejected() {
     );
     assert!(!world.exists("models/vae/x_vae.safetensors"));
     let workspace = Workspace::open(world.root(), None).unwrap();
-    assert!(!workspace.store.contains(&Sha256::of(b"tampered")));
+    assert!(!workspace.store.contains(&Sha256::of(b"tamperd")));
     assert!(
         !workspace
             .store
             .partial_path(&digest.to_string())
             .unwrap()
             .exists()
+    );
+}
+
+#[test]
+fn a_mirror_whose_blob_has_another_size_is_passed_over() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    let tampered = tamper(&world, b"tampered");
+
+    let (result, _, warnings) = world.sync_with(
+        &[Remote::Dir(tampered), Remote::Dir(world.public())],
+        Options::default(),
+    );
+
+    result.unwrap();
+    assert!(is_link_to_blob(
+        &world,
+        "models/vae/x_vae.safetensors",
+        b"weights"
+    ));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("expected 7 bytes, the mirror has 8"),
+        "{warnings:?}"
     );
 }
 

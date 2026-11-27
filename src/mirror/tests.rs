@@ -287,20 +287,46 @@ fn hf_pull_by_commit_writes_no_ref() {
 }
 
 #[test]
+fn a_download_that_stopped_before_it_was_stored_is_not_repeated() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
+    // Left complete by a pull that stopped before storing it.
+    let partial = mirror
+        .store
+        .partial_path(&Sha256::of(b"weights").to_string())
+        .unwrap();
+    fs::write(&partial, b"weights").unwrap();
+
+    let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+
+    assert_eq!(pulled.downloaded, 2);
+    assert_eq!(blob(&mirror, b"weights").unwrap(), b"weights");
+    let weights = format!("/{REPO}/resolve/{COMMIT}/vae/model.safetensors");
+    assert!(
+        !upstream.downloads().contains(&weights),
+        "{:?}",
+        upstream.downloads()
+    );
+}
+
+#[test]
 fn hf_pull_rejects_content_with_another_digest() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
     upstream.route(
         &format!("/{REPO}/resolve/{COMMIT}/vae/model.safetensors"),
-        b"tampered",
+        b"tamperd",
     );
+    // Of the announced size, so that only the digest tells.
     let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let error = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap_err();
 
     assert!(error.to_string().contains("expected sha256"), "{error}");
-    assert_eq!(blob(&mirror, b"tampered"), None);
+    assert_eq!(blob(&mirror, b"tamperd"), None);
     // The file fetched before the failure is served; the bad one is not, and
     // its partial file is gone so that the next pull starts it afresh.
     let snapshot = hf_snapshot(&mirror, COMMIT);

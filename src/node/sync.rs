@@ -680,9 +680,13 @@ fn fetch(
             return Ok(digest);
         }
         for remote in access.usable_remotes() {
-            let fetched = remote.fetch_blob(access.http, &digest, &partial, &mut |progress| {
-                on_event(Event::Progress(progress));
-            });
+            let fetched = remote.fetch_blob(
+                access.http,
+                &digest,
+                placement.size,
+                &partial,
+                &mut |progress| on_event(Event::Progress(progress)),
+            );
             match fetched {
                 Ok(Some(downloaded)) if downloaded.sha256 == digest => {
                     store.commit(&partial, &digest).map_err(Error::Store)?;
@@ -754,7 +758,7 @@ fn from_upstream(
             let request = Request {
                 url: &url,
                 headers: &hub.headers_for(&url),
-                size: None,
+                size: placement.size,
             };
             let downloaded = access.http.download(&request, partial, &mut progress)?;
             Ok((url, downloaded))
@@ -782,7 +786,7 @@ fn from_upstream(
             let request = Request {
                 url: &file.download_url,
                 headers: &site.headers_for(&file.download_url),
-                size: None,
+                size: placement.size,
             };
             let downloaded = access.http.download(&request, partial, &mut progress)?;
             Ok((file.download_url, downloaded))

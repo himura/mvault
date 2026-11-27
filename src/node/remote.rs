@@ -87,22 +87,25 @@ impl Remote {
     /// blob.
     ///
     /// The returned digest is of what was written; the caller compares it.
+    /// `size`, if known, is the size of the blob: nothing past it is
+    /// written, and a partial file of that size is complete already.
     ///
     /// # Errors
     ///
-    /// Returns an error if the mirror cannot be read or `partial` cannot be
-    /// written.
+    /// Returns an error if the mirror cannot be read, its blob has another
+    /// size than `size`, or `partial` cannot be written.
     pub fn fetch_blob(
         &self,
         http: &Client,
         digest: &Sha256,
+        size: Option<u64>,
         partial: &Path,
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Option<Downloaded>> {
         let relative = BlobStore::relative_path(digest);
         match self {
             Self::Dir(dir) => {
-                let copied = copy(&dir.join("blobs").join(relative), partial, progress)?;
+                let copied = copy(&dir.join("blobs").join(relative), size, partial, progress)?;
                 if copied.is_none() {
                     check_present(dir)?;
                 }
@@ -114,7 +117,7 @@ impl Remote {
                 let request = Request {
                     url: &url,
                     headers: &[],
-                    size: None,
+                    size,
                 };
                 match http.download(&request, partial, progress) {
                     Ok(downloaded) => Ok(Some(downloaded)),
@@ -152,6 +155,7 @@ fn check_present(dir: &Path) -> Result<()> {
 /// holds is hashed again and not copied again.
 fn copy(
     source: &Path,
+    size: Option<u64>,
     partial: &Path,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<Option<Downloaded>> {
@@ -161,6 +165,14 @@ fn copy(
         Err(error) => return Err(io_error(source)(error)),
     };
     let total = input.metadata().map_err(io_error(source))?.len();
+    if let Some(size) = size
+        && size != total
+    {
+        return Err(Error::Invalid(format!(
+            "{}: expected {size} bytes, the mirror has {total}",
+            source.display()
+        )));
+    }
     let mut output = File::options()
         .read(true)
         .write(true)
@@ -301,7 +313,7 @@ mod tests {
         assert!(remote.read(&http(), "snapshots/a.json").is_err());
         assert!(
             remote
-                .fetch_blob(&http(), &Sha256::of(b"x"), &partial, &mut |_| {})
+                .fetch_blob(&http(), &Sha256::of(b"x"), None, &partial, &mut |_| {})
                 .is_err()
         );
     }
@@ -342,7 +354,7 @@ mod tests {
 
             let mut seen = Vec::new();
             let fetched = remote
-                .fetch_blob(&http(), &digest, &partial, &mut |p| seen.push(p))
+                .fetch_blob(&http(), &digest, None, &partial, &mut |p| seen.push(p))
                 .unwrap()
                 .unwrap();
             assert_eq!((fetched.sha256, fetched.size), (digest, 7), "{remote}");
@@ -351,7 +363,7 @@ mod tests {
 
             fs::write(&partial, b"wei").unwrap();
             let continued = remote
-                .fetch_blob(&http(), &digest, &partial, &mut |_| {})
+                .fetch_blob(&http(), &digest, None, &partial, &mut |_| {})
                 .unwrap()
                 .unwrap();
             assert_eq!(continued.sha256, digest, "{remote}");
@@ -361,7 +373,7 @@ mod tests {
             let other = out.path().join("other");
             assert_eq!(
                 remote
-                    .fetch_blob(&http(), &missing, &other, &mut |_| {})
+                    .fetch_blob(&http(), &missing, None, &other, &mut |_| {})
                     .unwrap(),
                 None
             );
@@ -382,7 +394,7 @@ mod tests {
         fs::write(&partial, b"much longer than the blob").unwrap();
 
         let fetched = Remote::Dir(dir.path().to_owned())
-            .fetch_blob(&http(), &digest, &partial, &mut |_| {})
+            .fetch_blob(&http(), &digest, None, &partial, &mut |_| {})
             .unwrap()
             .unwrap();
 
