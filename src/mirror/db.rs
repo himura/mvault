@@ -350,18 +350,19 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be written.
+    /// Returns the error of `gone`, or an error if the database cannot be
+    /// written. Blobs forgotten before an error stay forgotten.
     pub fn forget_blobs(
         &mut self,
         digests: &[Sha256],
-        mut gone: impl FnMut(&Sha256) -> bool,
+        mut gone: impl FnMut(&Sha256) -> Result<bool>,
     ) -> Result<Vec<Sha256>> {
         let mut forgotten = Vec::new();
         for digest in digests {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if !gone(digest) {
+            if !gone(digest)? {
                 continue;
             }
             let hex = digest.to_string();
@@ -733,7 +734,7 @@ mod tests {
         );
 
         let forgotten = db
-            .forget_blobs(&[digest, here], |blob| *blob == digest)
+            .forget_blobs(&[digest, here], |blob| Ok(*blob == digest))
             .unwrap();
 
         assert_eq!(forgotten, [digest]);

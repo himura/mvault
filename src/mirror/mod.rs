@@ -522,9 +522,10 @@ impl Mirror {
         let request = Request {
             url: &job.url,
             headers,
-            // Announced sizes are compared afterwards instead: one that is
-            // wrong must fail the pull, not keep the download waiting.
-            size: None,
+            // Nothing past the announced size is written, and a server that
+            // announces another size fails before anything is read. A
+            // partial file of the announced size is complete already.
+            size: file.size,
         };
         let downloaded = http.download(&request, &partial, &mut |progress| {
             on_event(Event::Progress(progress));
@@ -578,6 +579,11 @@ impl Mirror {
     pub fn gc(&mut self, min_age: Duration, dry_run: bool) -> Result<Collected> {
         let cutoff = db::now().saturating_sub(min_age.as_secs());
         let store = &self.store;
+        // Blobs that cannot be seen are not gone: without their directory,
+        // every blob would be forgotten and downloaded again.
+        if !self.db.blob_digests()?.is_empty() {
+            store.check_present().map_err(Error::Store)?;
+        }
         let blobs = if dry_run {
             self.db.unused_blobs(cutoff)?
         } else {
@@ -595,7 +601,7 @@ impl Mirror {
             // In a dry run the unused blobs are still listed; whether
             // their files exist no longer matters.
             let unused = blobs.iter().any(|(blob, _)| blob == digest);
-            if !unused && !store.contains(digest) {
+            if !unused && !store.find(digest).map_err(Error::Store)? {
                 let snapshots = self
                     .db
                     .blob_snapshots(digest)?
@@ -610,9 +616,9 @@ impl Mirror {
         }
         if !dry_run {
             let gone: Vec<Sha256> = missing.iter().map(|blob| blob.sha256).collect();
-            let forgotten = self
-                .db
-                .forget_blobs(&gone, |digest| !store.contains(digest))?;
+            let forgotten = self.db.forget_blobs(&gone, |digest| {
+                store.find(digest).map(|found| !found).map_err(Error::Store)
+            })?;
             // A pull stored the blob again in the meantime.
             missing.retain(|blob| forgotten.contains(&blob.sha256));
             // Nodes read from the snapshot files which files are fetched.

@@ -491,6 +491,67 @@ fn a_managed_file_is_replaced_when_the_manifest_changes() {
     assert_eq!(world.lock_text(), lock);
 }
 
+/// Places `config.json` at `models/current.bin` and the weights elsewhere,
+/// then writes down `models/current.bin` as the weights: what a sync that
+/// stopped between writing down a replacement and linking it leaves.
+fn stop_before_replacing(world: &World) {
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [\n  {{ path = \"config.json\", dest = \"models/current.bin\" }},\n  {{ path = \"vae/model.safetensors\", dest = \"models/weights.bin\" }},\n]\n"
+    ));
+    world.sync(Options::default()).unwrap();
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let weights = Sha256::of(b"weights");
+    let stamp = Stamp::of(&workspace.store.blob_path(&weights))
+        .unwrap()
+        .unwrap();
+    let mut record = Placed::load(&workspace.placed_path()).unwrap();
+    record.insert("models/current.bin".to_owned(), stamp.entry(weights));
+    record.save(&workspace.placed_path()).unwrap();
+}
+
+#[test]
+fn a_replacement_that_was_written_down_but_not_linked_is_done_next_time() {
+    let world = World::new();
+    stop_before_replacing(&world);
+
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"vae/model.safetensors\", dest = \"models/current.bin\" }}]\n"
+    ));
+    let report = world.sync(Options::default()).unwrap();
+
+    assert_eq!(report.conflicts, Vec::<String>::new());
+    assert_eq!(report.linked, 1);
+    assert!(is_link_to_blob(&world, "models/current.bin", b"weights"));
+}
+
+#[test]
+fn a_file_dropped_while_its_replacement_was_not_linked_is_still_pruned() {
+    let world = World::new();
+    stop_before_replacing(&world);
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"vae/model.safetensors\", dest = \"models/weights.bin\" }}]\n"
+    ));
+
+    let without = world.sync(Options::default()).unwrap();
+    assert_eq!(without.dropped, ["models/current.bin"]);
+    // The record now names the blob the file is a link to.
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let record = Placed::load(&workspace.placed_path()).unwrap();
+    assert_eq!(
+        record.get("models/current.bin").map(|entry| entry.sha256),
+        Some(Sha256::of(b"{}"))
+    );
+
+    let report = world
+        .sync(Options {
+            prune: true,
+            ..Options::default()
+        })
+        .unwrap();
+    assert_eq!(report.pruned, 1);
+    assert!(!world.exists("models/current.bin"));
+}
+
 #[test]
 fn prune_removes_recorded_files_only() {
     let world = World::new();
@@ -835,16 +896,14 @@ fn a_mirror_that_fails_is_passed_over_with_a_warning() {
     assert_eq!(failing.requests().len(), 1);
 }
 
-#[test]
-fn a_blob_with_other_content_is_rejected() {
-    let world = World::new();
-    world.manifest(REPO_ENTRY);
-    // A copy of the mirror in which one blob was replaced.
+/// A copy of the mirror of `world` in which the blob of the weights has
+/// `content`.
+fn tamper(world: &World, content: &[u8]) -> PathBuf {
     let tampered = world.dir.path().join("tampered");
     let digest = Sha256::of(b"weights");
     let relative = Path::new("blobs").join(BlobStore::relative_path(&digest));
     fs::create_dir_all(tampered.join(&relative).parent().unwrap()).unwrap();
-    fs::write(tampered.join(&relative), b"tampered").unwrap();
+    fs::write(tampered.join(&relative), content).unwrap();
     for path in [
         format!("snapshots/hf/{HUB}/{REPO}/{COMMIT}.json"),
         format!("snapshots/hf/{HUB}/{REPO}/refs/main"),
@@ -852,6 +911,16 @@ fn a_blob_with_other_content_is_rejected() {
         fs::create_dir_all(tampered.join(&path).parent().unwrap()).unwrap();
         fs::copy(world.public().join(&path), tampered.join(&path)).unwrap();
     }
+    tampered
+}
+
+#[test]
+fn a_blob_with_other_content_is_rejected() {
+    let world = World::new();
+    // Of the size of the blob, so that only the digest tells.
+    let tampered = tamper(&world, b"tamperd");
+    world.manifest(REPO_ENTRY);
+    let digest = Sha256::of(b"weights");
 
     let (result, _, _) = world.sync_with(&[Remote::Dir(tampered)], Options::default());
 
@@ -862,13 +931,37 @@ fn a_blob_with_other_content_is_rejected() {
     );
     assert!(!world.exists("models/vae/x_vae.safetensors"));
     let workspace = Workspace::open(world.root(), None).unwrap();
-    assert!(!workspace.store.contains(&Sha256::of(b"tampered")));
+    assert!(!workspace.store.contains(&Sha256::of(b"tamperd")));
     assert!(
         !workspace
             .store
             .partial_path(&digest.to_string())
             .unwrap()
             .exists()
+    );
+}
+
+#[test]
+fn a_mirror_whose_blob_has_another_size_is_passed_over() {
+    let world = World::new();
+    world.manifest(REPO_ENTRY);
+    let tampered = tamper(&world, b"tampered");
+
+    let (result, _, warnings) = world.sync_with(
+        &[Remote::Dir(tampered), Remote::Dir(world.public())],
+        Options::default(),
+    );
+
+    result.unwrap();
+    assert!(is_link_to_blob(
+        &world,
+        "models/vae/x_vae.safetensors",
+        b"weights"
+    ));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("expected 7 bytes, the mirror has 8"),
+        "{warnings:?}"
     );
 }
 

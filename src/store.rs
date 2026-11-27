@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil::sync_dir;
 use crate::hash::Sha256;
 
 /// A directory of blobs and the directory where they are written before they
@@ -62,6 +63,44 @@ impl BlobStore {
         self.blob_path(digest).is_file()
     }
 
+    /// Whether the blob with this digest is stored, telling a blob that is
+    /// absent from one that cannot be looked at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be looked at for another reason
+    /// than that it does not exist.
+    pub fn find(&self, digest: &Sha256) -> io::Result<bool> {
+        let path = self.blob_path(digest);
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(with_path(&error, &path)),
+        }
+    }
+
+    /// Checks that the directory of the blobs is there, so that a store
+    /// that is not mounted is not taken for one whose blobs are gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory is missing or cannot be looked at.
+    pub fn check_present(&self) -> io::Result<()> {
+        let root = self.blobs.join("sha256");
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a directory", root.display()),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not there (is it mounted?)", root.display()),
+            )),
+            Err(error) => Err(with_path(&error, &root)),
+        }
+    }
+
     /// The directory of unfinished files.
     #[must_use]
     pub fn tmp_dir(&self) -> &Path {
@@ -77,14 +116,14 @@ impl BlobStore {
     pub fn remove(&self, digest: &Sha256) -> io::Result<()> {
         let path = self.blob_path(digest);
         let removed = fs::remove_file(&path).or_else(|error| {
-            if error.kind() != io::ErrorKind::PermissionDenied {
+            // On Unix whether a file can be removed depends on its directory
+            // alone. Its mode is shared with every file placed as a link to
+            // it, so it is not touched.
+            if cfg!(unix) || error.kind() != io::ErrorKind::PermissionDenied {
                 return Err(error);
             }
             // Where a read-only file cannot be removed as it is.
-            let mut permissions = fs::metadata(&path)?.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            fs::set_permissions(&path, permissions)?;
+            make_writable(&path)?;
             fs::remove_file(&path)
         });
         match removed {
@@ -209,9 +248,9 @@ impl Prepared {
             return Ok(Committed::AlreadyPresent);
         }
         make_read_only(&file).map_err(|e| with_path(&e, &file))?;
-        if let Err(e) = fs::rename(&file, &dest) {
-            // Where a rename does not replace a read-only file, losing the
-            // race against another writer of the same blob ends up here.
+        if let Err(e) = place(&file, &dest) {
+            // Losing the race against another writer of the same blob ends
+            // up here: its blob stays as it is.
             if dest.is_file() {
                 fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
                 return Ok(Committed::AlreadyPresent);
@@ -226,6 +265,27 @@ impl Prepared {
         }
         Ok(Committed::Added)
     }
+}
+
+/// Gives `file` the name `dest`, unless something has that name already.
+///
+/// A blob stored meanwhile by another writer must not be replaced: the
+/// files placed as links to it would no longer be the blob. A hard link
+/// fails where its name is taken; the name `file` is removed afterwards.
+#[cfg(unix)]
+fn place(file: &Path, dest: &Path) -> io::Result<()> {
+    fs::hard_link(file, dest)?;
+    // The blob is in place. Were the old name left behind, it would be
+    // just another link to the blob: no download writes to a partial file
+    // whose content is stored already, and garbage collection removes it.
+    let _ = fs::remove_file(file);
+    Ok(())
+}
+
+/// Where a rename does not replace a read-only file, as a blob is.
+#[cfg(not(unix))]
+fn place(file: &Path, dest: &Path) -> io::Result<()> {
+    fs::rename(file, dest)
 }
 
 #[cfg(unix)]
@@ -277,18 +337,6 @@ fn create_dir_all_synced(dir: &Path) -> io::Result<()> {
     if let Some(parent) = parent {
         sync_dir(parent).map_err(|e| with_path(&e, parent))?;
     }
-    Ok(())
-}
-
-/// Makes the rename into `dir` durable.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -394,6 +442,53 @@ mod tests {
 
         assert_eq!(prepared.commit().unwrap(), Committed::AlreadyPresent);
         assert!(!second.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_that_cannot_be_removed_stays_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        store
+            .commit(&write_partial(&store, "one", b"abc"), &digest)
+            .unwrap();
+        let blob = store.blob_path(&digest);
+        let shard = blob.parent().unwrap().to_owned();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.remove(&digest);
+
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o755)).unwrap();
+        if result.is_ok() {
+            // Run by root, who may remove it all the same.
+            return;
+        }
+        let mode = fs::metadata(&blob).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placing_a_file_never_replaces_a_stored_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        store
+            .commit(&write_partial(&store, "one", b"abc"), &digest)
+            .unwrap();
+        let blob = store.blob_path(&digest);
+        let placed = dir.path().join("placed");
+        fs::hard_link(&blob, &placed).unwrap();
+        // As when another writer stores the blob after commit looked.
+        let late = write_partial(&store, "two", b"abc");
+
+        let error = place(&late, &blob).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(same_file::is_same_file(&placed, &blob).unwrap());
+        assert!(late.exists());
     }
 
     #[test]
