@@ -15,7 +15,7 @@ use super::manifest::{LOCK_NAME, MANIFEST_NAME, STATE_DIR};
 use super::placed::PLACED_NAME;
 use super::remote::Remote;
 use crate::error::{Error, Result};
-use crate::fsutil::{io_error, write_atomic};
+use crate::fsutil::{io_error, wait_for_lock, write_atomic};
 use crate::source::Defaults;
 use crate::store::BlobStore;
 
@@ -116,11 +116,7 @@ impl Workspace {
             }
             Err(error) => return Err(io_error(&path)(error)),
         };
-        if create {
-            file.lock().map_err(io_error(&path))?;
-        } else {
-            file.lock_shared().map_err(io_error(&path))?;
-        }
+        wait_for_lock(&file, &path, create)?;
         Ok(Some(file))
     }
 

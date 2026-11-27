@@ -372,6 +372,7 @@ fn settle_dropped(
         match fate {
             Fate::Remove => {
                 let path = workspace.root.join(dest);
+                debug!("removing {}", path.display());
                 remove_if_exists(&path)?;
                 record.remove(dest);
                 on_event(Event::Pruned(dest));
@@ -988,6 +989,7 @@ fn link(store: &BlobStore, blob: &Path, dest: &Path) -> Result<()> {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     remove_if_exists(&tmp)?;
+    debug!("linking {} to {}", dest.display(), blob.display());
     fs::hard_link(blob, &tmp).map_err(io_error(&tmp))?;
     let renamed = fs::rename(&tmp, dest).or_else(|error| {
         // Where a rename does not replace an existing file. Elsewhere a

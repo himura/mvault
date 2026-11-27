@@ -5,10 +5,12 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use log::{debug, trace};
+
 use super::sync::LINK_PREFIX;
 use super::workspace::Workspace;
 use crate::error::{Error, Result};
-use crate::fsutil::io_error;
+use crate::fsutil::{io_error, wait_for_lock};
 use crate::gc::{PARTIAL_MAX_AGE, blob_at, clean_tmp};
 use crate::store::BlobStore;
 
@@ -60,12 +62,21 @@ pub fn gc(workspace: &Workspace, min_age: Duration, dry_run: bool) -> Result<Col
     let mut collected = Collected::default();
     for path in files {
         let Some(digest) = blob_at(store, &path) else {
+            debug!(
+                "{}: not a blob at the place of its digest; left alone",
+                path.display()
+            );
             collected.strays.push(path);
             continue;
         };
         let metadata = fs::metadata(&path).map_err(io_error(&path))?;
         let (links, changed) = links(&metadata)?;
-        if links > 1 || now.saturating_sub(changed) < min_age {
+        if links > 1 {
+            trace!("blob {digest}: {} file(s) linked to it; kept", links - 1);
+            continue;
+        }
+        if now.saturating_sub(changed) < min_age {
+            debug!("blob {digest}: nothing linked to it, but changed recently; kept");
             continue;
         }
         if !dry_run {
@@ -98,6 +109,7 @@ fn clean_links(store: &BlobStore, dry_run: bool) -> Result<Vec<PathBuf>> {
     links.sort();
     if !dry_run {
         for link in &links {
+            debug!("removing the link {} left by a sync", link.display());
             fs::remove_file(link).map_err(io_error(link))?;
         }
     }
@@ -116,11 +128,7 @@ pub(crate) fn gc_lock(store: &BlobStore, exclusive: bool) -> Result<File> {
         .write(true)
         .open(&path)
         .map_err(io_error(&path))?;
-    if exclusive {
-        file.lock().map_err(io_error(&path))?;
-    } else {
-        file.lock_shared().map_err(io_error(&path))?;
-    }
+    wait_for_lock(&file, &path, exclusive)?;
     Ok(file)
 }
 

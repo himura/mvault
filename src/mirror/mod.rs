@@ -11,7 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use log::{debug, trace};
+use log::debug;
 
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
@@ -526,7 +526,6 @@ impl Mirror {
         // One process at a time works on a partial file. The lock goes away
         // with the process, so a crash leaves nothing to clean up by hand.
         let lock_path = partial.with_extension("lock");
-        trace!("locking {}", lock_path.display());
         let _guard = lock_file(&lock_path)?;
         if let Some(digest) = &announced
             && self.db.use_stored_blob(snapshot_id, file.key(), digest)?
@@ -643,6 +642,7 @@ impl Mirror {
             // their files exist no longer matters.
             let unused = blobs.iter().any(|(blob, _)| blob == digest);
             if !unused && !store.find(digest).map_err(Error::Store)? {
+                debug!("blob {digest} is in the database, but its file is gone");
                 let snapshots = self
                     .db
                     .blob_snapshots(digest)?
