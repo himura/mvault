@@ -378,6 +378,60 @@ fn files_not_named_by_the_host_pulled_from_are_left_alone() {
 }
 
 #[test]
+fn a_config_dir_given_takes_the_place_of_the_default_one() {
+    let upstream = Upstream::start();
+    let config_home = tempfile::tempdir().unwrap();
+    write_tokens(config_home.path(), &[("example.com", "default")]);
+    let given = tempfile::tempdir().unwrap();
+    fs::create_dir_all(given.path().join("tokens")).unwrap();
+    fs::write(given.path().join("tokens/example.com"), "given\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let run = run(
+        &upstream,
+        dir.path(),
+        &[("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &[
+            "pull",
+            "--config-dir",
+            given.path().to_str().unwrap(),
+            "civitai:example.com:12345@67890",
+        ],
+    );
+
+    run.result.unwrap();
+    let sent = authorizations(&upstream);
+    assert_ne!(sent, []);
+    assert!(
+        sent.iter()
+            .all(|value| value.as_deref() == Some("Bearer given"))
+    );
+}
+
+#[test]
+fn a_config_dir_given_must_exist() {
+    let upstream = Upstream::start();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+
+    let run = run(
+        &upstream,
+        dir.path(),
+        &[],
+        &[
+            "pull",
+            "--config-dir",
+            missing.to_str().unwrap(),
+            "civitai:example.com:12345@67890",
+        ],
+    );
+
+    let error = run.result.unwrap_err().to_string();
+    assert!(error.contains("not a directory"), "{error}");
+    assert!(upstream.requests().is_empty());
+}
+
+#[test]
 fn selects_files_of_a_version_by_flag_and_by_url() {
     let upstream = Upstream::start();
 
@@ -742,6 +796,50 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
             "on the mirror host run: mvault mirror pull hf:huggingface.co:example-org/example-model"
         ),
         "{error}"
+    );
+}
+
+#[test]
+fn a_node_reads_its_settings_from_the_config_dir_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let config = dir.path().join("etc-mvault");
+    fs::create_dir_all(config.join("tokens")).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        "allow_official = true\n[civitai]\ndefault_host = \"example.com\"\n",
+    )
+    .unwrap();
+    fs::write(config.join("tokens/example.com"), "site-secret\n").unwrap();
+    let env = [];
+    let workspace = dir.path().join("mlenv");
+    run_in(&upstream, dir.path(), &env, &["init", "mlenv"])
+        .result
+        .unwrap();
+    let config = config.to_str().unwrap();
+
+    for args in [
+        &[
+            "--config-dir",
+            config,
+            "add",
+            "civitai:12345",
+            "--dest",
+            "models/loras/",
+        ][..],
+        &["--config-dir", config, "sync"][..],
+    ] {
+        run_in(&upstream, &workspace, &env, args).result.unwrap();
+    }
+    assert_eq!(
+        fs::read(workspace.join("models/loras/model.safetensors")).unwrap(),
+        b"weights"
+    );
+    let sent = authorizations(&upstream);
+    assert_ne!(sent, []);
+    assert!(
+        sent.iter()
+            .all(|value| value.as_deref() == Some("Bearer site-secret"))
     );
 }
 

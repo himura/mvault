@@ -1,7 +1,7 @@
 //! The commands run in a workspace.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -91,8 +91,12 @@ pub(super) struct GcArgs {
     min_age: std::time::Duration,
 }
 
-pub(super) fn gc(args: &GcArgs, context: &mut Context<'_>) -> Result<()> {
-    let workspace = open(context)?;
+pub(super) fn gc(
+    args: &GcArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
     let collected = crate::node::gc::gc(&workspace, args.min_age, args.dry_run)?;
     for path in &collected.strays {
         let _ = writeln!(
@@ -137,8 +141,12 @@ pub(super) fn init(args: &InitArgs, context: &mut Context<'_>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn add(args: &AddArgs, context: &mut Context<'_>) -> Result<()> {
-    let workspace = open(context)?;
+pub(super) fn add(
+    args: &AddArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
     let reference = Reference::parse(&args.source, &workspace.defaults())
         .map_err(|e| Error::Invalid(e.to_string()))?;
     let request = add::Request {
@@ -150,7 +158,7 @@ pub(super) fn add(args: &AddArgs, context: &mut Context<'_>) -> Result<()> {
         revision: args.revision.as_deref(),
         file: &args.file,
     };
-    let added = with_access(&workspace, context, |access, _| {
+    let added = with_access(&workspace, config_dir, context, |access, _| {
         add::add(&workspace, access, &request)
     })?;
     match added {
@@ -165,15 +173,19 @@ pub(super) fn add(args: &AddArgs, context: &mut Context<'_>) -> Result<()> {
     }
 }
 
-pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
-    let workspace = open(context)?;
+pub(super) fn sync(
+    args: &SyncArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
     let options = Options {
         dry_run: args.dry_run,
         locked: args.locked,
         prune: args.prune,
         force: args.force,
     };
-    let report = with_access(&workspace, context, |access, reporter| {
+    let report = with_access(&workspace, config_dir, context, |access, reporter| {
         sync::sync(&workspace, access, options, &mut |event| {
             // Progress output is best effort.
             let _ = match event {
@@ -240,9 +252,9 @@ pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
     }
 }
 
-fn open(context: &Context<'_>) -> Result<Workspace> {
+fn open(config_dir: Option<&Path>, context: &Context<'_>) -> Result<Workspace> {
     let root = Workspace::find(&context.cwd)?;
-    Workspace::open(root, global_path(context.env).as_deref())
+    Workspace::open(root, config_dir.map(global_path).as_deref())
 }
 
 fn say(context: &mut Context<'_>, text: &str) -> Result<()> {
@@ -254,12 +266,13 @@ fn say(context: &mut Context<'_>, text: &str) -> Result<()> {
 /// upstreams, then prints the warnings that came up.
 fn with_access<T>(
     workspace: &Workspace,
+    config_dir: Option<&Path>,
     context: &mut Context<'_>,
     run: impl FnOnce(&Access<'_>, &mut Reporter<'_>) -> Result<T>,
 ) -> Result<T> {
     let remotes = workspace.remotes()?;
     // Each token is for one host only; see `mvault mirror pull`.
-    let tokens = Tokens::new(context.env);
+    let tokens = Tokens::new(config_dir, context.env);
     let base_url = context.base_url;
     let access = Access {
         http: &context.http,
