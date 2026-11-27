@@ -9,6 +9,8 @@ use std::io::{self, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use log::{debug, trace};
+use ureq::ResponseExt as _;
 use ureq::config::RedirectAuthHeaders;
 use ureq::tls::{RootCerts, TlsConfig};
 
@@ -273,7 +275,21 @@ impl Client {
         progress: &mut dyn FnMut(Progress),
     ) -> Result<Downloaded, DownloadError> {
         let mut target = Target::open(dest)?;
+        debug!(
+            "download {} into {} ({} expected, {} already there)",
+            redact(request.url),
+            dest.display(),
+            request.size.map_or_else(
+                || "size not known".to_owned(),
+                |size| format!("{size} bytes")
+            ),
+            target.len
+        );
         if request.size.is_some_and(|size| target.len > size) {
+            debug!(
+                "{} holds more than the expected size; starting over",
+                dest.display()
+            );
             target.clear()?;
         }
         progress(Progress {
@@ -314,6 +330,10 @@ impl Client {
                     // beginning of this one, so what it reached is no measure.
                     restarted = true;
                     furthest = 0;
+                    debug!(
+                        "{}: the server does not have the rest of the partial file; starting over",
+                        redact(request.url)
+                    );
                     target.clear()?;
                     "the server does not have the rest of the partial file".to_owned()
                 }
@@ -324,13 +344,18 @@ impl Client {
             }
             failures += 1;
             if failures >= self.retry.max_failures {
+                debug!(
+                    "{}: {reason}; giving up after {failures} failure(s) in a row",
+                    redact(request.url)
+                );
                 return Err(DownloadError::Failed {
                     url: request.url.to_owned(),
                     reason,
                 });
             }
-            std::thread::sleep(self.retry.delay(failures));
+            self.pause(request.url, &reason, failures);
         }
+        debug!("downloaded {} bytes of {}", target.len, redact(request.url));
         Ok(Downloaded {
             sha256: target.hasher.finish(),
             size: target.len,
@@ -356,13 +381,30 @@ impl Client {
             };
             failures += 1;
             if failures >= self.retry.max_failures {
+                debug!(
+                    "{}: {reason}; giving up after {failures} failure(s) in a row",
+                    redact(url)
+                );
                 return Err(DownloadError::Failed {
                     url: url.to_owned(),
                     reason,
                 });
             }
-            std::thread::sleep(self.retry.delay(failures));
+            self.pause(url, &reason, failures);
         }
+    }
+
+    /// Waits before the request to `url` is repeated after `failures`
+    /// failures in a row.
+    fn pause(&self, url: &str, reason: &str, failures: u32) {
+        let delay = self.retry.delay(failures);
+        debug!(
+            "{}: {reason}; retrying in {:.1}s (failure {failures} of at most {})",
+            redact(url),
+            delay.as_secs_f64(),
+            self.retry.max_failures
+        );
+        std::thread::sleep(delay);
     }
 
     fn get_once(&self, url: &str, headers: &[(&str, &str)]) -> Result<Vec<u8>, Failure> {
@@ -408,7 +450,16 @@ impl Client {
         if let Some(start) = range_from {
             call = call.header("Range", format!("bytes={start}-"));
         }
-        call.call().map_err(|error| match error {
+        let credentials = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        debug!(
+            "GET {}{}{}",
+            redact(url),
+            range_from.map_or_else(String::new, |start| format!(" from byte {start}")),
+            if credentials { " with credentials" } else { "" }
+        );
+        let response = call.call().map_err(|error| match error {
             ureq::Error::Io(_)
             | ureq::Error::Timeout(_)
             | ureq::Error::ConnectionFailed
@@ -418,7 +469,20 @@ impl Client {
                 url: url.to_owned(),
                 reason: error.to_string(),
             }),
-        })
+        })?;
+        let status = response.status();
+        let at = response.get_uri().to_string();
+        if at == url {
+            debug!("GET {}: {status}", redact(url));
+        } else {
+            debug!("GET {}: {status} from {}", redact(url), redact(&at));
+        }
+        for (name, value) in response.headers() {
+            if is_shown_header(name.as_str()) {
+                trace!("  {name}: {}", value.to_str().unwrap_or("(not text)"));
+            }
+        }
+        Ok(response)
     }
 
     /// One request for whatever `target` is missing. Returns when the server
@@ -446,6 +510,10 @@ impl Client {
             200 => {
                 // The server ignored the range and sends everything.
                 if target.len > 0 {
+                    debug!(
+                        "{}: the server ignored the range and sends the whole file",
+                        redact(request.url)
+                    );
                     target.clear().map_err(Failure::Fatal)?;
                 }
                 response.body().content_length()
@@ -533,6 +601,40 @@ fn too_long(request: &Request<'_>, target: &mut Target<'_>, size: u64) -> Failur
     })
 }
 
+/// `url` as the log shows it: without the user and password, and without
+/// the query, which in a signed URL is what grants access.
+pub(crate) fn redact(url: &str) -> String {
+    let (url, query) = match url.find(['?', '#']) {
+        Some(at) => (&url[..at], true),
+        None => (url, false),
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("***@{host}"),
+        None => authority.to_owned(),
+    };
+    let separator = if scheme.is_empty() { "" } else { "://" };
+    let rest = if query { "?…" } else { "" };
+    format!("{scheme}{separator}{host}{path}{rest}")
+}
+
+/// Whether the log shows the response header `name`: those that tell about
+/// the content, and none that may carry a secret, such as `Set-Cookie` or
+/// a `Location` with a signed URL.
+fn is_shown_header(name: &str) -> bool {
+    [
+        "accept-ranges",
+        "content-length",
+        "content-range",
+        "content-type",
+        "etag",
+        "last-modified",
+    ]
+    .iter()
+    .any(|shown| name.eq_ignore_ascii_case(shown))
+}
+
 fn size_mismatch(request: &Request<'_>, actual: u64) -> DownloadError {
     DownloadError::SizeMismatch {
         url: request.url.to_owned(),
@@ -577,6 +679,35 @@ mod tests {
 
     use super::*;
     use crate::testutil::{Response, TestServer};
+
+    #[test]
+    fn the_log_shows_urls_without_credentials_or_query() {
+        assert_eq!(
+            redact("https://example.com/a/b.bin"),
+            "https://example.com/a/b.bin"
+        );
+        assert_eq!(
+            redact("https://user:secret@example.com:8443/blobs/x"),
+            "https://***@example.com:8443/blobs/x"
+        );
+        assert_eq!(
+            redact("https://cdn.example.com/x?X-Signature=abc&Expires=1"),
+            "https://cdn.example.com/x?…"
+        );
+        assert_eq!(redact("https://example.com#part"), "https://example.com?…");
+        assert_eq!(
+            redact("https://a@b@example.com/"),
+            "https://***@example.com/"
+        );
+    }
+
+    #[test]
+    fn the_log_shows_no_header_that_may_carry_a_secret() {
+        assert!(is_shown_header("Content-Length"));
+        assert!(is_shown_header("etag"));
+        assert!(!is_shown_header("set-cookie"));
+        assert!(!is_shown_header("location"));
+    }
 
     fn client() -> Client {
         Client::new(RetryPolicy {
