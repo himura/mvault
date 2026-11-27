@@ -163,6 +163,7 @@ fn is_glob(pattern: &str) -> bool {
 
 fn read(workspace: &Path, file: &str) -> Result<RawManifest> {
     let path = workspace.join(file);
+    log::debug!("reading the manifest {}", path.display());
     let text = fs::read_to_string(&path).map_err(io_error(&path))?;
     toml::from_str(&text).map_err(|e| Error::Invalid(format!("{file}: {e}")))
 }

@@ -169,6 +169,7 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
             let root = mirror.root.ok_or_else(|| {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
+            log::debug!("mirror {}", root.display());
             match mirror.command {
                 MirrorCommand::Init => mirror_init(&root, context),
                 MirrorCommand::Pull(args) => pull(&root, &args, config_dir, context),

@@ -112,9 +112,13 @@ pub fn global_path(config: &Path) -> PathBuf {
 fn read(path: &Path) -> Result<RawConfig> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(RawConfig::default()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            log::debug!("no settings in {}", path.display());
+            return Ok(RawConfig::default());
+        }
         Err(error) => return Err(io_error(path)(error)),
     };
+    log::debug!("reading the settings in {}", path.display());
     toml::from_str(&text).map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))
 }
 
