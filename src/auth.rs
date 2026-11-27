@@ -82,8 +82,8 @@ impl<'a> Tokens<'a> {
 }
 
 /// The directory of mvault's own settings when none is given:
-/// `$XDG_CONFIG_HOME/mvault`, by default `~/.config/mvault` (see
-/// [`home_dir`] for `~`).
+/// `$XDG_CONFIG_HOME/mvault`, by default `~/.config/mvault`, where `~` is
+/// `HOME`, else `USERPROFILE`.
 #[must_use]
 pub fn default_config_dir(env: Env<'_>) -> Option<PathBuf> {
     let config = non_empty(env("XDG_CONFIG_HOME"))
