@@ -26,8 +26,7 @@ pub struct Config {
     pub allow_official: bool,
     /// Directory of the blobs, if not `.mvault/blobs` in the workspace.
     pub blobs: Option<PathBuf>,
-    /// The host assumed for `civitai:` sources that name none, and the only
-    /// one the site token is sent to.
+    /// The host assumed for `civitai:` sources that name none.
     pub civitai_host: Option<String>,
 }
 
@@ -95,7 +94,7 @@ impl Config {
             self.blobs = Some(workspace.join(blobs));
         }
         if let Some(host) = raw.civitai.default_host {
-            // Compared with the host of a source, which is written one way.
+            // Taken into sources, which spell a host one way.
             let host =
                 normalize_host(&host).map_err(|e| invalid(format!("civitai.default_host: {e}")))?;
             self.civitai_host = Some(host);

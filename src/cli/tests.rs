@@ -135,6 +135,15 @@ fn run_in(upstream: &Upstream, cwd: &Path, env: &[(&str, &str)], args: &[&str]) 
     }
 }
 
+/// Writes token files into `config_home`, the value of `XDG_CONFIG_HOME`.
+fn write_tokens(config_home: &Path, tokens: &[(&str, &str)]) {
+    let dir = config_home.join("mvault/tokens");
+    fs::create_dir_all(&dir).unwrap();
+    for (host, token) in tokens {
+        fs::write(dir.join(host), format!("{token}\n")).unwrap();
+    }
+}
+
 fn configure(root: &Path, content: &str) {
     fs::create_dir_all(root.join("private")).unwrap();
     fs::write(root.join("private/config.toml"), content).unwrap();
@@ -264,11 +273,13 @@ fn pulls_the_latest_version_of_a_model_from_the_configured_site() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     configure(dir.path(), "[civitai]\ndefault_host = \"example.com\"\n");
+    let config_home = tempfile::tempdir().unwrap();
+    write_tokens(config_home.path(), &[("example.com", "secret")]);
 
     let run = run(
         &upstream,
         dir.path(),
-        &[("CIVITAI_TOKEN", "secret")],
+        &[("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         &["pull", "civitai", "12345"],
     );
 
@@ -287,15 +298,17 @@ fn pulls_the_latest_version_of_a_model_from_the_configured_site() {
 }
 
 #[test]
-fn the_site_token_goes_to_the_configured_site_only() {
+fn a_site_token_goes_to_its_own_host_only() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     configure(dir.path(), "[civitai]\ndefault_host = \"example.com\"\n");
+    let config_home = tempfile::tempdir().unwrap();
+    write_tokens(config_home.path(), &[("example.com", "secret")]);
 
     let run = run(
         &upstream,
         dir.path(),
-        &[("CIVITAI_TOKEN", "secret")],
+        &[("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
         &[
             "pull",
             "https://other.example.net/models/12345?modelVersionId=67890",
@@ -309,6 +322,56 @@ fn the_site_token_goes_to_the_configured_site_only() {
         run.out
     );
     assert!(authorizations(&upstream).iter().all(Option::is_none));
+}
+
+#[test]
+fn each_site_gets_the_token_of_its_host() {
+    let upstream = Upstream::start();
+    let config_home = tempfile::tempdir().unwrap();
+    write_tokens(
+        config_home.path(),
+        &[("example.com", "first"), ("other.example.net", "second")],
+    );
+    let env = [("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())];
+
+    let mut seen = 0;
+    for (host, token) in [("other.example.net", "second"), ("example.com", "first")] {
+        // No default host is configured: the files alone say where tokens go.
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("https://{host}/models/12345?modelVersionId=67890");
+        run(&upstream, dir.path(), &env, &["pull", &url])
+            .result
+            .unwrap();
+        let sent = authorizations(&upstream);
+        let expected = format!("Bearer {token}");
+        assert!(sent.len() > seen);
+        assert!(
+            sent[seen..]
+                .iter()
+                .all(|value| value.as_deref() == Some(expected.as_str())),
+            "{host}"
+        );
+        seen = sent.len();
+    }
+}
+
+#[test]
+fn a_token_file_not_named_by_a_host_is_an_error() {
+    let upstream = Upstream::start();
+    let config_home = tempfile::tempdir().unwrap();
+    write_tokens(config_home.path(), &[("Example.com", "secret")]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let run = run(
+        &upstream,
+        dir.path(),
+        &[("XDG_CONFIG_HOME", config_home.path().to_str().unwrap())],
+        &["pull", "civitai:example.com:12345@67890"],
+    );
+
+    let error = run.result.unwrap_err().to_string();
+    assert!(error.contains("named by the host"), "{error}");
+    assert_eq!(authorizations(&upstream), []);
 }
 
 #[test]
@@ -690,11 +753,8 @@ fn without_a_mirror_the_upstream_is_used_with_the_token_of_its_host() {
         "allow_official = true\n[civitai]\ndefault_host = \"example.com\"\n",
     )
     .unwrap();
-    let env = [
-        ("HOME", home.to_str().unwrap()),
-        ("HF_TOKEN", "hub-secret"),
-        ("CIVITAI_TOKEN", "site-secret"),
-    ];
+    write_tokens(&home.join(".config"), &[("example.com", "site-secret")]);
+    let env = [("HOME", home.to_str().unwrap()), ("HF_TOKEN", "hub-secret")];
     let workspace = dir.path().join("mlenv");
     run_in(&upstream, dir.path(), &env, &["init", "mlenv"])
         .result
