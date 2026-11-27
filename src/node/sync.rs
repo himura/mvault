@@ -3,16 +3,23 @@
 //!
 //! A placed file is a hard link to a blob, and that is also how mvault knows
 //! its own files: a file that is the same file as a blob is managed, any
-//! other file belongs to the user and is left alone.
+//! other file belongs to the user and is left alone. Which managed files may
+//! be removed is decided by the record of placed files alone.
+//!
+//! A sync first looks at the workspace and decides what to do (`survey`),
+//! then does it. A dry run stops after the first part, so it shows what a
+//! real run would do.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::gc::gc_lock;
 use super::lock::Lock;
-use super::manifest::{Manifest, STATE_DIR};
+use super::manifest::Manifest;
+use super::placed::{Placed, Stamp, hash_file};
 use super::plan::{Placement, plan, unresolved};
 use super::resolve::{Access, fill_digests, parse_source, resolve};
 use super::workspace::Workspace;
@@ -23,6 +30,9 @@ use crate::hash::Sha256;
 use crate::source::Source;
 use crate::store::BlobStore;
 
+/// Prefix of the temporary links a sync makes next to the blobs.
+pub(crate) const LINK_PREFIX: &str = "link-";
+
 /// How to sync.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -31,9 +41,9 @@ pub struct Options {
     pub dry_run: bool,
     /// Fail rather than resolve models the lock file does not have.
     pub locked: bool,
-    /// Remove managed files the manifest no longer places.
+    /// Remove recorded files the manifest no longer places.
     pub prune: bool,
-    /// Replace files that are in the way.
+    /// Replace files that are in the way, and blobs that were written to.
     pub force: bool,
 }
 
@@ -48,10 +58,19 @@ pub struct Report {
     pub linked: usize,
     /// Files that were already in place.
     pub unchanged: usize,
-    /// Managed files removed.
+    /// Recorded files removed.
     pub pruned: usize,
     /// Destinations taken by files mvault does not manage.
     pub conflicts: Vec<String>,
+    /// Destinations whose blob was written to. Without `force` they are
+    /// left as they are.
+    pub damaged: Vec<String>,
+    /// Recorded files the manifest no longer places, left in place for
+    /// want of `prune`.
+    pub dropped: Vec<String>,
+    /// Recorded files the manifest no longer places that `prune` did not
+    /// remove, because their blob was written to.
+    pub kept: Vec<String>,
 }
 
 /// Something to tell the user while a sync runs.
@@ -81,8 +100,60 @@ pub enum Event<'a> {
     Linked(&'a str),
     /// A destination is taken by a file mvault does not manage.
     Conflict(&'a str),
-    /// A managed file the manifest no longer places was removed.
+    /// The blob of a file was written to: its content is no longer what
+    /// its digest says.
+    Damaged(&'a str),
+    /// A recorded file the manifest no longer places was removed.
     Pruned(&'a str),
+    /// A recorded file the manifest no longer places was not removed,
+    /// because its blob was written to.
+    Kept(&'a str),
+}
+
+/// What to do with a file the manifest places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Nothing is there: link it.
+    Place,
+    /// A managed file with other content, or with `force` any file, is
+    /// there: link over it.
+    Replace,
+    /// It is in place.
+    Keep,
+    /// Something mvault does not manage is there.
+    Conflict,
+    /// Its blob was written to, and without `force` it is left alone.
+    Damaged,
+}
+
+/// What to do with a recorded file the manifest no longer places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// Remove it (with `prune`).
+    Remove,
+    /// Leave it, and its entry (without `prune`).
+    Leave,
+    /// Its blob was written to: leave it, and its entry.
+    Damaged,
+    /// It is gone or no longer a link to its blob: forget it.
+    Forget,
+}
+
+/// What a sync is going to do.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Survey {
+    /// What to do with each placement, by its index.
+    pub(crate) actions: Vec<Action>,
+    /// The placements whose blob is to be fetched, one per blob.
+    pub(crate) fetch: Vec<usize>,
+    /// Blobs whose content no longer has their digest.
+    pub(crate) damaged: BTreeSet<Sha256>,
+    /// Recorded files the manifest no longer places, and what to do with
+    /// them.
+    pub(crate) dropped: Vec<(String, Fate)>,
+    /// Blobs that were touched but still have their digest, with their
+    /// stamp now.
+    pub(crate) restamped: BTreeMap<Sha256, Stamp>,
 }
 
 /// Makes `workspace` match its manifest.
@@ -91,14 +162,17 @@ pub enum Event<'a> {
 ///
 /// Returns an error if the manifest or lock file is not valid, a model
 /// cannot be resolved, or a blob cannot be fetched or does not have the
-/// digest of the lock file. Destinations taken by other files are not an
-/// error here; they are listed in the report.
+/// digest of the lock file. Destinations taken by other files and damaged
+/// blobs are not an error here; they are listed in the report.
 pub fn sync(
     workspace: &Workspace,
     access: &Access<'_>,
     options: Options,
     on_event: &mut dyn FnMut(Event<'_>),
 ) -> Result<Report> {
+    // One command at a time changes the workspace: the lock file and the
+    // record are read and written under this lock.
+    let _workspace = workspace.lock(!options.dry_run)?;
     // Held to the end: a garbage collection must not take a blob away
     // between its fetch and its first link.
     let _in_use = if options.dry_run {
@@ -117,78 +191,376 @@ pub fn sync(
     }
 
     let mut placements = plan(&manifest, &lock)?;
-    let mut seen = BTreeSet::new();
-    let to_fetch: Vec<usize> = placements
-        .iter()
-        .enumerate()
-        .filter(|(_, placement)| match placement.sha256 {
-            Some(digest) => !workspace.store.contains(&digest) && seen.insert(digest),
-            None => true,
-        })
-        .map(|(index, _)| index)
-        .collect();
-    report.fetched = to_fetch.len();
-    if !options.dry_run {
-        report.fetched = 0;
-        for (position, index) in to_fetch.iter().enumerate() {
-            if placements[*index].sha256.is_some() && is_stored(workspace, &placements[*index]) {
-                // The same file, placed twice, was fetched for the other place.
-                continue;
-            }
-            on_event(Event::Fetching {
-                index: position + 1,
-                count: to_fetch.len(),
-                dest: &placements[*index].dest,
-            });
-            let digest = fetch(workspace, access, &placements[*index], on_event)?;
-            on_event(Event::Fetched);
-            report.fetched += 1;
-            if placements[*index].sha256.is_none() {
-                record_digest(&mut lock, &placements[*index], digest);
-                lock.save(&lock_path)?;
-                let fetched = placements[*index].clone();
-                for placement in &mut placements {
-                    if same_file(placement, &fetched) {
-                        placement.sha256 = Some(digest);
-                    }
+    workspace.check_dests(placements.iter().map(|placement| placement.dest.as_str()))?;
+    let record_path = workspace.placed_path();
+    let mut record = Placed::load(&record_path)?;
+    let survey = survey(workspace, &placements, &record, options)?;
+
+    if options.dry_run {
+        tell(&survey, &placements, &mut report, on_event);
+        report.fetched = survey.fetch.len();
+        return Ok(report);
+    }
+
+    // A blob that was written to is taken out of the store; the files
+    // linked to it keep the content they were given.
+    if options.force {
+        for digest in &survey.damaged {
+            workspace.store.remove(digest).map_err(Error::Store)?;
+        }
+    }
+
+    for (position, index) in survey.fetch.iter().enumerate() {
+        if is_stored(workspace, &placements[*index]) {
+            // The same file, placed twice, was fetched for the other place.
+            continue;
+        }
+        on_event(Event::Fetching {
+            index: position + 1,
+            count: survey.fetch.len(),
+            dest: &placements[*index].dest,
+        });
+        let digest = fetch(workspace, access, &placements[*index], on_event)?;
+        on_event(Event::Fetched);
+        report.fetched += 1;
+        if placements[*index].sha256.is_none() {
+            record_digest(&mut lock, &placements[*index], digest);
+            lock.save(&lock_path)?;
+            let fetched = placements[*index].clone();
+            for placement in &mut placements {
+                if same_file(placement, &fetched) {
+                    placement.sha256 = Some(digest);
                 }
             }
         }
     }
 
-    let mut managed = Managed::new(&workspace.store);
-    for placement in &placements {
+    record_placements(workspace, &placements, &survey, &mut record)?;
+    record.save(&record_path)?;
+
+    for (placement, action) in placements.iter().zip(&survey.actions) {
         let dest = workspace.root.join(&placement.dest);
-        let blob = placement
-            .sha256
-            .map(|digest| workspace.store.blob_path(&digest));
-        match state(&dest, blob.as_deref(), &mut managed)? {
-            State::InPlace => report.unchanged += 1,
-            State::Taken if !options.force => {
+        match action {
+            Action::Keep => report.unchanged += 1,
+            Action::Conflict => {
                 on_event(Event::Conflict(&placement.dest));
                 report.conflicts.push(placement.dest.clone());
             }
-            State::Free | State::Managed | State::Taken => {
-                if let (false, Some(blob)) = (options.dry_run, &blob) {
-                    link(blob, &dest)?;
-                }
+            Action::Damaged => {
+                on_event(Event::Damaged(&placement.dest));
+                report.damaged.push(placement.dest.clone());
+            }
+            Action::Place | Action::Replace => {
+                let digest = placement.sha256.ok_or_else(|| {
+                    Error::Invalid(format!("{}: the digest is still unknown", placement.dest))
+                })?;
+                link(&workspace.store, &workspace.store.blob_path(&digest), &dest)?;
                 on_event(Event::Linked(&placement.dest));
                 report.linked += 1;
             }
         }
     }
 
-    if options.prune {
-        prune(
-            workspace,
-            &placements,
-            &mut managed,
-            options.dry_run,
-            &mut report,
-            on_event,
-        )?;
-    }
+    settle_dropped(
+        workspace,
+        &survey,
+        options,
+        &mut record,
+        &mut report,
+        on_event,
+    )?;
+    record.save(&record_path)?;
     Ok(report)
+}
+
+/// Writes down the files about to be linked, and the new stamps of blobs
+/// that were touched.
+fn record_placements(
+    workspace: &Workspace,
+    placements: &[Placement],
+    survey: &Survey,
+    record: &mut Placed,
+) -> Result<()> {
+    // Written down before the links are made: a file linked but not
+    // recorded could never be pruned, while an entry for a link that was
+    // not made is forgotten by the next sync.
+    for (digest, stamp) in &survey.restamped {
+        let dests: Vec<String> = record
+            .iter()
+            .filter(|(_, entry)| entry.sha256 == *digest)
+            .map(|(dest, _)| dest.to_owned())
+            .collect();
+        for dest in dests {
+            record.insert(dest, stamp.entry(*digest));
+        }
+    }
+    for (placement, action) in placements.iter().zip(&survey.actions) {
+        match action {
+            Action::Place | Action::Replace | Action::Keep => {
+                let Some(digest) = placement.sha256 else {
+                    continue;
+                };
+                let blob = workspace.store.blob_path(&digest);
+                let stamp = Stamp::of(&blob)?.ok_or_else(|| {
+                    Error::Invalid(format!("blob {digest} is gone from {}", blob.display()))
+                })?;
+                record.insert(placement.dest.clone(), stamp.entry(digest));
+            }
+            Action::Conflict => {
+                record.remove(&placement.dest);
+            }
+            Action::Damaged => {}
+        }
+    }
+    Ok(())
+}
+
+/// Removes, keeps or forgets the recorded files the manifest no longer
+/// places, as the survey decided.
+fn settle_dropped(
+    workspace: &Workspace,
+    survey: &Survey,
+    options: Options,
+    record: &mut Placed,
+    report: &mut Report,
+    on_event: &mut dyn FnMut(Event<'_>),
+) -> Result<()> {
+    for (dest, fate) in &survey.dropped {
+        match fate {
+            Fate::Remove => {
+                let path = workspace.root.join(dest);
+                remove_if_exists(&path)?;
+                record.remove(dest);
+                on_event(Event::Pruned(dest));
+                report.pruned += 1;
+            }
+            Fate::Leave => report.dropped.push(dest.clone()),
+            Fate::Damaged if options.force => {
+                // Its blob is out of the store: it is an ordinary file now.
+                record.remove(dest);
+            }
+            Fate::Damaged => {
+                on_event(Event::Kept(dest));
+                report.kept.push(dest.clone());
+            }
+            Fate::Forget => {
+                record.remove(dest);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tells what a dry run found.
+fn tell(
+    survey: &Survey,
+    placements: &[Placement],
+    report: &mut Report,
+    on_event: &mut dyn FnMut(Event<'_>),
+) {
+    for (placement, action) in placements.iter().zip(&survey.actions) {
+        match action {
+            Action::Keep => report.unchanged += 1,
+            Action::Conflict => {
+                on_event(Event::Conflict(&placement.dest));
+                report.conflicts.push(placement.dest.clone());
+            }
+            Action::Damaged => {
+                on_event(Event::Damaged(&placement.dest));
+                report.damaged.push(placement.dest.clone());
+            }
+            Action::Place | Action::Replace => {
+                on_event(Event::Linked(&placement.dest));
+                report.linked += 1;
+            }
+        }
+    }
+    for (dest, fate) in &survey.dropped {
+        match fate {
+            Fate::Remove => {
+                on_event(Event::Pruned(dest));
+                report.pruned += 1;
+            }
+            Fate::Leave => report.dropped.push(dest.clone()),
+            Fate::Damaged => {
+                on_event(Event::Kept(dest));
+                report.kept.push(dest.clone());
+            }
+            Fate::Forget => {}
+        }
+    }
+}
+
+/// Looks at the destinations and the blobs, and decides what a sync does.
+/// Changes nothing.
+///
+/// # Errors
+///
+/// Returns an error if a file or blob cannot be looked at.
+pub(crate) fn survey(
+    workspace: &Workspace,
+    placements: &[Placement],
+    record: &Placed,
+    options: Options,
+) -> Result<Survey> {
+    let store = &workspace.store;
+    let mut blobs = Blobs::new(store, record);
+    let mut managed = Managed::new(store);
+    let mut survey = Survey::default();
+
+    let mut wanted_blobs = BTreeSet::new();
+    let mut unknown = Vec::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let dest = workspace.root.join(&placement.dest);
+        let blob = match placement.sha256 {
+            Some(digest) => Some((digest, blobs.state(digest)?)),
+            None => None,
+        };
+        let damaged = matches!(blob, Some((_, BlobState::Damaged)));
+        let stored = matches!(blob, Some((_, BlobState::Stored)));
+        if damaged && !options.force {
+            survey.actions.push(Action::Damaged);
+            continue;
+        }
+        let needs_fetch = match blob {
+            Some((digest, _)) => !stored && wanted_blobs.insert(digest),
+            None => {
+                !unknown.iter().any(|other| same_file(other, placement)) && {
+                    unknown.push(placement.clone());
+                    true
+                }
+            }
+        };
+        if needs_fetch {
+            survey.fetch.push(index);
+        }
+
+        let in_place = match blob {
+            Some((digest, BlobState::Stored)) => is_same(&dest, &store.blob_path(&digest))?,
+            _ => false,
+        };
+        let action = if in_place {
+            Action::Keep
+        } else {
+            match what_is_at(&dest)? {
+                At::Nothing => Action::Place,
+                At::Other => {
+                    if options.force {
+                        Action::Replace
+                    } else {
+                        Action::Conflict
+                    }
+                }
+                At::File => {
+                    let recorded = record.get(&placement.dest).map(|entry| entry.sha256);
+                    let is_managed = match recorded {
+                        Some(digest) => is_same(&dest, &store.blob_path(&digest))?,
+                        None => managed.contains(&dest)?,
+                    };
+                    if is_managed || options.force {
+                        Action::Replace
+                    } else {
+                        Action::Conflict
+                    }
+                }
+            }
+        };
+        survey.actions.push(action);
+    }
+
+    let placed: BTreeSet<&str> = placements
+        .iter()
+        .map(|placement| placement.dest.as_str())
+        .collect();
+    for (dest, entry) in record.iter() {
+        if placed.contains(dest) {
+            continue;
+        }
+        let path = workspace.root.join(dest);
+        let blob = store.blob_path(&entry.sha256);
+        let fate = if !is_same(&path, &blob)? {
+            Fate::Forget
+        } else if blobs.state(entry.sha256)? == BlobState::Damaged {
+            Fate::Damaged
+        } else if options.prune {
+            Fate::Remove
+        } else {
+            Fate::Leave
+        };
+        survey.dropped.push((dest.to_owned(), fate));
+    }
+    survey.damaged = blobs.damaged();
+    survey.restamped = blobs.restamped;
+    Ok(survey)
+}
+
+/// The state of a blob, as far as the sync is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobState {
+    /// The store does not have it.
+    Missing,
+    /// The store has it with its content.
+    Stored,
+    /// The store has it, but its content was written to.
+    Damaged,
+}
+
+/// Finds out the state of blobs, once each. A blob is read again only if
+/// its stamp differs from the one recorded.
+struct Blobs<'a> {
+    store: &'a BlobStore,
+    recorded: HashMap<Sha256, Stamp>,
+    known: HashMap<Sha256, BlobState>,
+    restamped: BTreeMap<Sha256, Stamp>,
+}
+
+impl<'a> Blobs<'a> {
+    fn new(store: &'a BlobStore, record: &Placed) -> Self {
+        let mut recorded = HashMap::new();
+        for (_, entry) in record.iter() {
+            recorded.entry(entry.sha256).or_insert(Stamp {
+                size: entry.size,
+                mtime_ns: entry.mtime_ns,
+            });
+        }
+        Self {
+            store,
+            recorded,
+            known: HashMap::new(),
+            restamped: BTreeMap::new(),
+        }
+    }
+
+    fn state(&mut self, digest: Sha256) -> Result<BlobState> {
+        if let Some(state) = self.known.get(&digest) {
+            return Ok(*state);
+        }
+        let path = self.store.blob_path(&digest);
+        let state = match Stamp::of(&path)? {
+            None => BlobState::Missing,
+            Some(stamp) => match self.recorded.get(&digest) {
+                Some(recorded) if *recorded != stamp => {
+                    if hash_file(&path)? == digest {
+                        self.restamped.insert(digest, stamp);
+                        BlobState::Stored
+                    } else {
+                        BlobState::Damaged
+                    }
+                }
+                _ => BlobState::Stored,
+            },
+        };
+        self.known.insert(digest, state);
+        Ok(state)
+    }
+
+    fn damaged(&self) -> BTreeSet<Sha256> {
+        self.known
+            .iter()
+            .filter(|(_, state)| **state == BlobState::Damaged)
+            .map(|(digest, _)| *digest)
+            .collect()
+    }
 }
 
 /// Resolves the models the lock lacks and fills in digests a mirror knows
@@ -246,37 +618,6 @@ fn same_file(a: &Placement, b: &Placement) -> bool {
     (&a.source, &a.revision, &a.path, a.file_id) == (&b.source, &b.revision, &b.path, b.file_id)
 }
 
-/// Removes managed files that the manifest no longer places, from the
-/// directories it places files in.
-fn prune(
-    workspace: &Workspace,
-    placements: &[Placement],
-    managed: &mut Managed<'_>,
-    dry_run: bool,
-    report: &mut Report,
-    on_event: &mut dyn FnMut(Event<'_>),
-) -> Result<()> {
-    let wanted: BTreeSet<&str> = placements
-        .iter()
-        .map(|placement| placement.dest.as_str())
-        .collect();
-    for dir in top_dirs(&wanted) {
-        let mut files = Vec::new();
-        walk(&workspace.root, &dir, &mut files)?;
-        for file in files {
-            let path = workspace.root.join(&file);
-            if !wanted.contains(file.as_str()) && managed.contains(&path)? {
-                if !dry_run {
-                    fs::remove_file(&path).map_err(io_error(&path))?;
-                }
-                on_event(Event::Pruned(&file));
-                report.pruned += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Writes the digest of a file fetched for the first time into the lock.
 fn record_digest(lock: &mut Lock, placement: &Placement, digest: Sha256) {
     let locked = lock.get_mut(&placement.source, placement.revision.as_deref());
@@ -323,7 +664,7 @@ fn fetch(
         if store.contains(&digest) {
             return Ok(digest);
         }
-        for remote in access.remotes {
+        for remote in access.usable_remotes() {
             let fetched = remote.fetch_blob(access.http, &digest, &partial, &mut |progress| {
                 on_event(Event::Progress(progress));
             });
@@ -340,7 +681,7 @@ fn fetch(
                     )));
                 }
                 Ok(None) => {}
-                Err(error) => access.warn(format!("mirror {remote}: {error}")),
+                Err(error) => access.mirror_failed(remote, &error),
             }
         }
     }
@@ -453,38 +794,40 @@ fn pull_command(source: &Source, placement: &Placement) -> String {
     }
 }
 
-/// What is at a destination.
-enum State {
+/// What is at a destination, before it is compared with any blob.
+enum At {
     /// Nothing.
-    Free,
-    /// The blob it should be.
-    InPlace,
-    /// Another blob: a file mvault placed earlier.
-    Managed,
-    /// Something mvault does not manage.
-    Taken,
+    Nothing,
+    /// A regular file.
+    File,
+    /// A directory, a symbolic link or anything else that is not a regular
+    /// file.
+    Other,
 }
 
-fn state(dest: &Path, blob: Option<&Path>, managed: &mut Managed<'_>) -> Result<State> {
-    let metadata = match fs::symlink_metadata(dest) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::Free),
-        Err(error) => return Err(io_error(dest)(error)),
-    };
-    if !metadata.is_file() {
-        return Ok(State::Taken);
+fn what_is_at(dest: &Path) -> Result<At> {
+    match fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.is_file() => Ok(At::File),
+        Ok(_) => Ok(At::Other),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(At::Nothing),
+        Err(error) => Err(io_error(dest)(error)),
     }
-    if let Some(blob) = blob
-        && blob.is_file()
-        && same_file::is_same_file(dest, blob).map_err(io_error(dest))?
-    {
-        return Ok(State::InPlace);
+}
+
+/// Whether `path` is a regular file and the same file as `blob`. Either
+/// may be missing.
+fn is_same(path: &Path, blob: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(path)(error)),
     }
-    Ok(if managed.contains(dest)? {
-        State::Managed
-    } else {
-        State::Taken
-    })
+    match same_file::is_same_file(path, blob) {
+        Ok(same) => Ok(same),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(path)(error)),
+    }
 }
 
 /// Tells whether a file is a hard link to one of the blobs. The blobs are
@@ -525,15 +868,35 @@ impl<'a> Managed<'a> {
 }
 
 /// Makes `dest` a hard link to `blob`, replacing what is there.
-fn link(blob: &Path, dest: &Path) -> Result<()> {
+///
+/// The link is made under a temporary name next to the blobs and renamed
+/// into place, so that the destination is never missing or half there, and
+/// a sync that stops leaves nothing behind in the workspace. Garbage
+/// collection removes what it leaves next to the blobs.
+fn link(store: &BlobStore, blob: &Path, dest: &Path) -> Result<()> {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let dir = dest.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(io_error(dir))?;
-    let name = dest.file_name().unwrap_or_default().to_string_lossy();
-    // Linked under another name first, so that the destination is never
-    // missing or half there.
-    let tmp = dir.join(format!(".{name}.mvault-{}", std::process::id()));
+    let tmp_dir = store.tmp_dir();
+    fs::create_dir_all(tmp_dir).map_err(io_error(tmp_dir))?;
+    let tmp = tmp_dir.join(format!(
+        "{LINK_PREFIX}{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     remove_if_exists(&tmp)?;
-    fs::hard_link(blob, &tmp).map_err(|error| {
+    fs::hard_link(blob, &tmp).map_err(io_error(&tmp))?;
+    let renamed = fs::rename(&tmp, dest).or_else(|error| {
+        // Where a rename does not replace an existing file. Elsewhere a
+        // failed rename leaves the destination as it was.
+        if cfg!(unix) || !dest.is_file() {
+            return Err(error);
+        }
+        fs::remove_file(dest)?;
+        fs::rename(&tmp, dest)
+    });
+    renamed.map_err(|error| {
+        let _ = fs::remove_file(&tmp);
         if error.kind() == io::ErrorKind::CrossesDevices {
             Error::Invalid(format!(
                 "{} and {} are on different filesystems; a placed file is a hard link to its blob \
@@ -544,15 +907,6 @@ fn link(blob: &Path, dest: &Path) -> Result<()> {
         } else {
             io_error(dest)(error)
         }
-    })?;
-    let renamed = fs::rename(&tmp, dest).or_else(|_| {
-        // Where a rename does not replace an existing file.
-        fs::remove_file(dest)?;
-        fs::rename(&tmp, dest)
-    });
-    renamed.map_err(|error| {
-        let _ = fs::remove_file(&tmp);
-        io_error(dest)(error)
     })
 }
 
@@ -561,58 +915,6 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_error(path)(error)),
         _ => Ok(()),
     }
-}
-
-/// The directories files are placed in, without those inside another one.
-/// The workspace itself is the empty string.
-fn top_dirs(dests: &BTreeSet<&str>) -> Vec<String> {
-    let dirs: BTreeSet<&str> = dests
-        .iter()
-        .map(|dest| dest.rsplit_once('/').map_or("", |(dir, _)| dir))
-        .collect();
-    let mut top: Vec<String> = Vec::new();
-    // Sorted, so a directory comes before those inside it.
-    for dir in dirs {
-        let inside = top
-            .iter()
-            .any(|other| other.is_empty() || dir.starts_with(&format!("{other}/")));
-        if !inside {
-            top.push(dir.to_owned());
-        }
-    }
-    top
-}
-
-/// Lists the regular files below `dir` (relative to `root`, with `/`),
-/// leaving out mvault's own directory and anything that is not a plain file.
-fn walk(root: &Path, dir: &str, files: &mut Vec<String>) -> Result<()> {
-    let path = root.join(dir);
-    let entries = match fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error(&path)(error)),
-    };
-    for entry in entries {
-        let entry = entry.map_err(io_error(&path))?;
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let relative = if dir.is_empty() {
-            name
-        } else {
-            format!("{dir}/{name}")
-        };
-        if relative == STATE_DIR {
-            continue;
-        }
-        let kind = entry.file_type().map_err(io_error(&path))?;
-        if kind.is_dir() {
-            walk(root, &relative, files)?;
-        } else if kind.is_file() {
-            files.push(relative);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::fsutil::{check_relative, io_error};
+use crate::mirror::exclude::Excludes;
 use crate::source::{Defaults, Reference, Source};
 
 /// Name of the manifest at the root of a workspace.
@@ -50,8 +51,10 @@ pub enum Select {
     Whole {
         /// Directory to place the tree in.
         dest: String,
-        /// Patterns of files to leave out.
+        /// Globs of files to leave out.
         exclude: Vec<String>,
+        /// Regular expressions of files to leave out.
+        exclude_regexp: Vec<String>,
     },
     /// The primary file of a model version.
     Primary {
@@ -75,9 +78,11 @@ pub struct FileSpec {
 /// What an entry of `files` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum What {
-    /// A path in a repository.
+    /// A path in a repository, as it is: `*` or `[` in it are part of the
+    /// name.
     Path(String),
-    /// A glob over the paths of a repository.
+    /// A glob over the paths of a repository. `*` does not cross a `/`;
+    /// `**` does.
     Glob(String),
     /// The id of a file of a model version.
     FileId(u64),
@@ -99,6 +104,7 @@ struct RawModel {
     revision: Option<String>,
     dest: Option<String>,
     exclude: Option<Vec<String>>,
+    exclude_regexp: Option<Vec<String>>,
     files: Option<Vec<RawFile>>,
 }
 
@@ -106,6 +112,7 @@ struct RawModel {
 #[serde(deny_unknown_fields)]
 struct RawFile {
     path: Option<String>,
+    glob: Option<String>,
     file_id: Option<u64>,
     dest: String,
 }
@@ -142,9 +149,10 @@ impl Manifest {
     }
 }
 
-/// Whether `pattern` is a glob rather than a plain path.
-#[must_use]
-pub fn is_glob(pattern: &str) -> bool {
+/// Whether an `include` pattern is a glob rather than a plain path. Only
+/// for `include`, which names the files of the workspace itself; a file of
+/// a model is given by `path` or by `glob`.
+fn is_glob(pattern: &str) -> bool {
     pattern.contains(['*', '?', '[', '{'])
 }
 
@@ -182,8 +190,14 @@ fn included_files(workspace: &Path, patterns: &[String]) -> Result<Vec<String>> 
             .map_err(|e| invalid(e.to_string()))?
             .compile_matcher();
         let dir_path = workspace.join(dir);
+        let entries = match fs::read_dir(&dir_path) {
+            Ok(entries) => entries,
+            // No directory, no matches: as with a directory without them.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error(&dir_path)(error)),
+        };
         let mut found = Vec::new();
-        for entry in fs::read_dir(&dir_path).map_err(io_error(&dir_path))? {
+        for entry in entries {
             let entry = entry.map_err(io_error(&dir_path))?;
             let Ok(file_name) = entry.file_name().into_string() else {
                 continue;
@@ -254,25 +268,32 @@ fn parse_model(raw: RawModel, defaults: &Defaults) -> std::result::Result<Parsed
         }
     };
 
+    let has_excludes = raw.exclude.is_some() || raw.exclude_regexp.is_some();
     let select = match (raw.dest, raw.files) {
         (Some(_), Some(_)) => return Err("give either dest or files, not both".into()),
         (None, None) => return Err("needs dest or files".into()),
         (Some(dest), None) => {
             check_dest(&dest)?;
             if is_repo {
+                let exclude = raw.exclude.unwrap_or_default();
+                let exclude_regexp = raw.exclude_regexp.unwrap_or_default();
+                Excludes::new(&exclude, &exclude_regexp).map_err(|e| e.to_string())?;
                 Select::Whole {
                     dest,
-                    exclude: raw.exclude.unwrap_or_default(),
+                    exclude,
+                    exclude_regexp,
                 }
-            } else if raw.exclude.is_some() {
-                return Err("exclude is for whole repositories".into());
+            } else if has_excludes {
+                return Err("exclude and exclude_regexp are for whole repositories".into());
             } else {
                 Select::Primary { dest }
             }
         }
         (None, Some(files)) => {
-            if raw.exclude.is_some() {
-                return Err("exclude is for whole repositories, not for files".into());
+            if has_excludes {
+                return Err(
+                    "exclude and exclude_regexp are for whole repositories, not for files".into(),
+                );
             }
             if files.is_empty() {
                 return Err("files is empty".into());
@@ -289,22 +310,25 @@ fn parse_model(raw: RawModel, defaults: &Defaults) -> std::result::Result<Parsed
 
 fn parse_file(raw: RawFile, is_repo: bool) -> std::result::Result<FileSpec, String> {
     check_dest(&raw.dest)?;
-    let what = match (is_repo, raw.path, raw.file_id) {
-        (true, Some(path), None) => {
-            if is_glob(&path) {
-                GlobBuilder::new(&path)
-                    .literal_separator(true)
-                    .build()
-                    .map_err(|e| format!("invalid glob {path:?}: {e}"))?;
-                What::Glob(path)
-            } else {
-                check_relative(&path)?;
-                What::Path(path)
-            }
+    // The kind of an entry is told by its key, never by how it is written,
+    // so that a file whose name has `*` or `[` in it can be chosen.
+    let what = match (is_repo, raw.path, raw.glob, raw.file_id) {
+        (true, Some(path), None, None) => {
+            check_relative(&path)?;
+            What::Path(path)
         }
-        (false, None, Some(file_id)) => What::FileId(file_id),
-        (true, _, _) => return Err("a file of a repository is given by path".into()),
-        (false, _, _) => return Err("a file of a model version is given by file_id".into()),
+        (true, None, Some(glob), None) => {
+            GlobBuilder::new(&glob)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("invalid glob {glob:?}: {e}"))?;
+            What::Glob(glob)
+        }
+        (false, None, None, Some(file_id)) => What::FileId(file_id),
+        (true, _, _, _) => {
+            return Err("a file of a repository is given by one of path or glob".into());
+        }
+        (false, _, _, _) => return Err("a file of a model version is given by file_id".into()),
     };
     Ok(FileSpec {
         what,
@@ -363,14 +387,16 @@ mod tests {
             source = "hf:example-org/example-repackaged"
             files = [
               { path = "split_files/vae/x_vae.safetensors", dest = "models/vae/" },
-              { path = "split_files/upscaler/4x_*", dest = "models/upscale_models/" },
+              { glob = "split_files/upscaler/4x_*", dest = "models/upscale_models/" },
+              { path = "odd/[name]*.bin", dest = "models/odd/" },
             ]
 
             [[model]]
             source = "hf:hub.example.com:example-org/example-diffusers"
             revision = "v1.0"
             dest = "models/diffusers/example/"
-            exclude = ["assets/**"]
+            exclude = ["assets"]
+            exclude_regexp = ['\.mp4$']
 
             [[model]]
             source = "civitai:example.com:12345@67890"
@@ -404,6 +430,10 @@ mod tests {
                     what: What::Glob("split_files/upscaler/4x_*".into()),
                     dest: "models/upscale_models/".into()
                 },
+                FileSpec {
+                    what: What::Path("odd/[name]*.bin".into()),
+                    dest: "models/odd/".into()
+                },
             ])
         );
         assert_eq!(
@@ -417,7 +447,8 @@ mod tests {
             diffusers.select,
             Select::Whole {
                 dest: "models/diffusers/example/".into(),
-                exclude: vec!["assets/**".into()]
+                exclude: vec!["assets".into()],
+                exclude_regexp: vec![r"\.mp4$".into()],
             }
         );
         assert_eq!(
@@ -508,13 +539,16 @@ mod tests {
             let result = load(&[(MANIFEST_NAME, &format!("include = [\"{include}\"]\n"))]);
             assert!(result.is_err(), "{include}");
         }
-        // A glob that matches nothing includes nothing.
-        assert_eq!(
-            load(&[(MANIFEST_NAME, "include = [\"*.none\"]\n")])
-                .unwrap()
-                .models,
-            []
-        );
+        // A glob that matches nothing includes nothing, also in a directory
+        // that does not exist.
+        for include in ["*.none", "missing/*.toml"] {
+            assert_eq!(
+                load(&[(MANIFEST_NAME, &format!("include = [\"{include}\"]\n"))])
+                    .unwrap()
+                    .models,
+                []
+            );
+        }
     }
 
     #[test]
@@ -547,14 +581,18 @@ mod tests {
             (format!("{hf}dest = \"a/\"\nfiles = [{{ path = \"x\", dest = \"b/\" }}]\n"), "either dest or files"),
             (format!("{hf}files = []\n"), "files is empty"),
             (format!("{hf}revision = \"\"\ndest = \"a/\"\n"), "revision is empty"),
-            (format!("{hf}files = [{{ file_id = 1, dest = \"b/\" }}]\n"), "given by path"),
-            (format!("{hf}files = [{{ path = \"x\", file_id = 1, dest = \"b/\" }}]\n"), "given by path"),
+            (format!("{hf}files = [{{ file_id = 1, dest = \"b/\" }}]\n"), "one of path or glob"),
+            (format!("{hf}files = [{{ path = \"x\", file_id = 1, dest = \"b/\" }}]\n"), "one of path or glob"),
+            (format!("{hf}files = [{{ path = \"x\", glob = \"x\", dest = \"b/\" }}]\n"), "one of path or glob"),
             (format!("{hf}files = [{{ path = \"../x\", dest = \"b/\" }}]\n"), "unsafe path"),
-            (format!("{hf}files = [{{ path = \"a[\", dest = \"b/\" }}]\n"), "invalid glob"),
-            (format!("{hf}files = [{{ path = \"x\", dest = \"b/\" }}]\nexclude = [\"y\"]\n"), "exclude is for whole"),
+            (format!("{hf}files = [{{ glob = \"a[\", dest = \"b/\" }}]\n"), "invalid glob"),
+            (format!("{hf}dest = \"a/\"\nexclude_regexp = [\"(\"]\n"), "invalid exclude regular expression"),
+            (format!("{civitai}files = [{{ glob = \"x\", dest = \"b/\" }}]\n"), "given by file_id"),
+            (format!("{hf}files = [{{ path = \"x\", dest = \"b/\" }}]\nexclude = [\"y\"]\n"), "for whole repositories"),
+            (format!("{hf}files = [{{ path = \"x\", dest = \"b/\" }}]\nexclude_regexp = [\"y\"]\n"), "for whole repositories"),
             (format!("{hf}files = [{{ path = \"x\" }}]\n"), "missing field `dest`"),
             (format!("{civitai}revision = \"main\"\ndest = \"a/\"\n"), "revision is for repositories"),
-            (format!("{civitai}dest = \"a/\"\nexclude = [\"y\"]\n"), "exclude is for whole"),
+            (format!("{civitai}dest = \"a/\"\nexclude = [\"y\"]\n"), "for whole repositories"),
             (format!("{civitai}files = [{{ path = \"x\", dest = \"b/\" }}]\n"), "given by file_id"),
             (format!("{hf}dest = \"../outside/\"\n"), "inside the workspace"),
             (format!("{hf}dest = \"/abs/\"\n"), "inside the workspace"),

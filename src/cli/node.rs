@@ -41,10 +41,14 @@ pub(super) struct AddArgs {
     /// (ending in `/`) or, for a single file, a file name
     #[arg(long, value_name = "PATH")]
     dest: String,
-    /// Place only the files of a repository matching this path or glob
+    /// Place only this file of a repository, its path taken as it is
     /// (repeatable)
-    #[arg(long, value_name = "PATTERN")]
+    #[arg(long, value_name = "PATH")]
     path: Vec<String>,
+    /// Place only the files of a repository matching this glob, by their
+    /// names in the directory --dest (repeatable)
+    #[arg(long, value_name = "GLOB")]
+    glob: Vec<String>,
     /// Place this file of a model version instead of the primary one
     /// (repeatable)
     #[arg(long, value_name = "ID")]
@@ -70,7 +74,8 @@ pub(super) struct SyncArgs {
     /// Remove placed files that the manifest no longer has
     #[arg(long)]
     prune: bool,
-    /// Replace files that are in the way of a model
+    /// Replace files that are in the way of a model, and fetch again blobs
+    /// that were written to
     #[arg(long)]
     force: bool,
 }
@@ -80,11 +85,22 @@ pub(super) struct GcArgs {
     /// Only show what would be removed
     #[arg(short = 'n', long)]
     dry_run: bool,
+    /// Keep blobs whose last link went away more recently than this, such
+    /// as 12h or 7d
+    #[arg(long, value_name = "AGE", default_value = "1d", value_parser = crate::gc::parse_duration)]
+    min_age: std::time::Duration,
 }
 
 pub(super) fn gc(args: &GcArgs, context: &mut Context<'_>) -> Result<()> {
     let workspace = open(context)?;
-    let collected = crate::node::gc::gc(&workspace, args.dry_run)?;
+    let collected = crate::node::gc::gc(&workspace, args.min_age, args.dry_run)?;
+    for path in &collected.strays {
+        let _ = writeln!(
+            context.err,
+            "warning: {} is not a blob at its place; left alone",
+            path.display()
+        );
+    }
     let sizes: Vec<u64> = collected.blobs.iter().map(|(_, size)| *size).collect();
     super::report_gc(context, args.dry_run, &sizes, collected.partials.len())
 }
@@ -94,7 +110,21 @@ pub(super) fn init(args: &InitArgs, context: &mut Context<'_>) -> Result<()> {
         Some(dir) => context.cwd.join(dir),
         None => context.cwd.clone(),
     };
-    let created = workspace::init(&dir, &args.mirror, args.allow_official)?;
+    // Written as absolute paths: the settings must mean the same from
+    // wherever mvault runs.
+    let mirrors: Vec<String> = args
+        .mirror
+        .iter()
+        .map(|mirror| {
+            let is_path = !mirror.contains("://");
+            if is_path && !mirror.is_empty() && !std::path::Path::new(mirror).has_root() {
+                context.cwd.join(mirror).to_string_lossy().into_owned()
+            } else {
+                mirror.clone()
+            }
+        })
+        .collect();
+    let created = workspace::init(&dir, &mirrors, args.allow_official)?;
     for path in &created {
         say(context, &format!("created {}", path.display()))?;
     }
@@ -115,6 +145,7 @@ pub(super) fn add(args: &AddArgs, context: &mut Context<'_>) -> Result<()> {
         reference: &reference,
         dest: &args.dest,
         paths: &args.path,
+        globs: &args.glob,
         file_ids: &args.file_id,
         revision: args.revision.as_deref(),
         file: &args.file,
@@ -159,7 +190,16 @@ pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
                     reporter.err,
                     "conflict: {dest} exists and is not managed by mvault (--force replaces it)"
                 ),
+                Event::Damaged(dest) => writeln!(
+                    reporter.err,
+                    "damaged: the blob of {dest} was written to and no longer has its digest \
+                     (--force fetches it again)"
+                ),
                 Event::Pruned(dest) => writeln!(reporter.err, "pruned {dest}"),
+                Event::Kept(dest) => writeln!(
+                    reporter.err,
+                    "kept {dest}: its blob was written to (--force lets it go as an ordinary file)"
+                ),
             };
         })
     })?;
@@ -171,13 +211,32 @@ pub(super) fn sync(args: &SyncArgs, context: &mut Context<'_>) -> Result<()> {
             report.resolved, report.fetched, report.linked, report.unchanged, report.pruned
         ),
     )?;
-    if report.conflicts.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::Invalid(format!(
+    if !report.dropped.is_empty() {
+        say(
+            context,
+            &format!(
+                "{} placed file(s) are no longer in the manifest (--prune removes them)",
+                report.dropped.len()
+            ),
+        )?;
+    }
+    let mut problems = Vec::new();
+    if !report.conflicts.is_empty() {
+        problems.push(format!(
             "{} destination(s) are taken by files mvault does not manage",
             report.conflicts.len()
-        )))
+        ));
+    }
+    if !report.damaged.is_empty() {
+        problems.push(format!(
+            "{} file(s) have a blob that was written to",
+            report.damaged.len()
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(problems.join("; ")))
     }
 }
 
@@ -218,6 +277,7 @@ fn with_access<T>(
             Site::new(&base_url(host), token)
         },
         warnings: RefCell::default(),
+        down: RefCell::default(),
     };
     let mut reporter = Reporter {
         err: &mut *context.err,

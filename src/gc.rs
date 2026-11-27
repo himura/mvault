@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::error::Result;
 use crate::fsutil::{io_error, is_at};
+use crate::hash::Sha256;
+use crate::store::BlobStore;
 
 /// How long an unfinished download is kept for a later attempt to continue.
 pub const PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -45,15 +47,23 @@ pub fn clean_tmp(tmp: &Path, max_age: Duration, dry_run: bool) -> Result<Vec<Pat
 
     for partial in partials {
         let lock_path = partial.with_extension("lock");
+        // A dry run creates no lock file: where there is none, no download
+        // is running.
         let lock = fs::File::options()
-            .create(true)
+            .create(!dry_run)
             .truncate(false)
             .write(true)
-            .open(&lock_path)
-            .map_err(io_error(&lock_path))?;
+            .open(&lock_path);
+        let lock = match lock {
+            Ok(lock) => Some(lock),
+            Err(error) if dry_run && error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error(&lock_path)(error)),
+        };
         // A download in progress holds the lock; one that starts now waits
         // for it and then finds its lock file gone, and starts over.
-        if lock.try_lock().is_err() || !is_at(&lock, &lock_path) {
+        if let Some(lock) = &lock
+            && (lock.try_lock().is_err() || !is_at(lock, &lock_path))
+        {
             continue;
         }
         let stale = match fs::metadata(&partial) {
@@ -76,11 +86,20 @@ pub fn clean_tmp(tmp: &Path, max_age: Duration, dry_run: bool) -> Result<Vec<Pat
             }
             removed.push(partial);
         }
-        if !dry_run || !exists {
+        if !dry_run {
             fs::remove_file(&lock_path).map_err(io_error(&lock_path))?;
         }
     }
     Ok(removed)
+}
+
+/// The digest of the blob at `path`, if `path` is where the store keeps
+/// the blob of that digest. Any other file among the blobs is not a blob:
+/// garbage collection reports it and leaves it alone.
+#[must_use]
+pub fn blob_at(store: &BlobStore, path: &Path) -> Option<Sha256> {
+    let digest: Sha256 = path.file_name()?.to_str()?.parse().ok()?;
+    (store.blob_path(&digest) == path).then_some(digest)
 }
 
 /// Reads a duration such as `90s`, `30m`, `12h`, `7d`, or `0`.
@@ -165,7 +184,18 @@ mod tests {
         assert!(!file("partial-idle.lock").exists());
         assert!(file("partial-old.lock").exists());
 
+        let listing = || {
+            let mut names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing();
         let would = clean_tmp(dir.path(), Duration::ZERO, true).unwrap();
+        // A dry run neither creates lock files nor removes any.
+        assert_eq!(listing(), before);
         assert_eq!(
             would,
             [

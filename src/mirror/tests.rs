@@ -94,7 +94,7 @@ fn pull_hf(
     excludes: &[&str],
 ) -> Result<Pulled> {
     let hub = Hub::new(&upstream.base(), None);
-    let excludes = Excludes::new(excludes).unwrap();
+    let excludes = Excludes::new(excludes, &[] as &[&str]).unwrap();
     let pull = HfPull {
         hub: &hub,
         host: HOST,
@@ -126,7 +126,7 @@ fn hf_pull_fetches_files_and_writes_the_public_tree() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
 
@@ -182,7 +182,7 @@ fn hf_pull_again_downloads_nothing_and_adds_what_was_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
     let before = upstream.downloads().len();
 
@@ -192,7 +192,9 @@ fn hf_pull_again_downloads_nothing_and_adds_what_was_excluded() {
 
     // A narrower pull does not forget what an earlier one fetched.
     let narrower = pull_hf(&mut mirror, &upstream, "main", &["assets", "*.json"]).unwrap();
-    assert_eq!((narrower.present, narrower.skipped), (1, 2));
+    // What is not fetched is counted in the snapshot: config.json, left out
+    // this time, was fetched before.
+    assert_eq!((narrower.present, narrower.skipped), (1, 1));
     assert_eq!(
         hf_snapshot(&mirror, COMMIT)["files"][1].get("fetched"),
         None
@@ -212,7 +214,7 @@ fn hf_pull_of_a_new_commit_reuses_blobs_and_moves_the_ref() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
 
     let next = "89abcdef0123456789abcdef0123456789abcdef";
@@ -234,7 +236,7 @@ fn hf_pull_that_fails_leaves_the_ref_where_it_was() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     pull_hf(&mut mirror, &upstream, "main", &[]).unwrap();
 
     // The upstream moves on, and a file of the new commit cannot be fetched.
@@ -274,7 +276,7 @@ fn hf_pull_by_commit_writes_no_ref() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, COMMIT);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     pull_hf(&mut mirror, &upstream, COMMIT, &[]).unwrap();
 
@@ -293,7 +295,7 @@ fn hf_pull_rejects_content_with_another_digest() {
         &format!("/{REPO}/resolve/{COMMIT}/vae/model.safetensors"),
         b"tampered",
     );
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let error = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap_err();
 
@@ -320,7 +322,7 @@ fn hf_pull_rejects_content_with_another_size() {
         &format!("/{REPO}/resolve/{COMMIT}/config.json"),
         b"{\"longer\": true}",
     );
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let error = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap_err();
 
@@ -332,7 +334,7 @@ fn hf_pull_does_not_continue_a_partial_file_without_a_digest() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let config = FileEntry {
         path: "config.json".into(),
         file_id: None,
@@ -365,7 +367,7 @@ fn hf_pull_continues_a_partial_file_with_a_digest() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let partial = mirror
         .store
         .partial_path(&Sha256::of(b"weights").to_string())
@@ -389,7 +391,7 @@ fn hf_pull_sends_the_token_to_the_hub() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let hub = Hub::new(&upstream.base(), Some("secret"));
 
     mirror
@@ -423,9 +425,9 @@ fn hf_pull_reports_events_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let hub = Hub::new(&upstream.base(), None);
-    let excludes = Excludes::new(&["assets"]).unwrap();
+    let excludes = Excludes::new(&["assets"], &[] as &[&str]).unwrap();
 
     let mut log = Vec::new();
     mirror
@@ -445,6 +447,7 @@ fn hf_pull_reports_events_in_order() {
                 Event::Finished(outcome) => {
                     log.push(format!("{outcome:?}"));
                 }
+                Event::Failed(message) => log.push(format!("failed: {message}")),
                 Event::Progress(_) | Event::Warning(_) => {}
             },
         )
@@ -466,7 +469,7 @@ fn a_port_in_the_host_becomes_part_of_the_directory_name() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let hub = Hub::new(&upstream.base(), None);
 
     let pulled = mirror
@@ -554,7 +557,7 @@ fn civitai_pull_of_the_latest_version_fetches_the_primary_file() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     site_with_model(&upstream);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let pulled = pull_civitai(&mut mirror, &upstream, None, &Selection::Primary).unwrap();
 
@@ -606,7 +609,7 @@ fn civitai_pull_that_fails_does_not_set_latest() {
     let upstream = Upstream::start();
     site_with_model(&upstream);
     upstream.route("/api/download/models/67890?type=Pruned", b"other");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let latest = mirror
         .public_dir()
         .join(format!("snapshots/civitai/{SITE}/12345/latest"));
@@ -626,7 +629,7 @@ fn civitai_pull_of_a_given_version_does_not_move_latest() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     site_with_model(&upstream);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     pull_civitai(&mut mirror, &upstream, Some(67890), &Selection::Primary).unwrap();
 
@@ -648,7 +651,7 @@ fn civitai_pull_selects_files_by_id_or_all_of_them() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     site_with_model(&upstream);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let chosen = pull_civitai(
         &mut mirror,
@@ -683,7 +686,7 @@ fn civitai_pull_rejects_a_selection_that_does_not_fit() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     site_with_model(&upstream);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let unknown = pull_civitai(
         &mut mirror,
@@ -728,7 +731,7 @@ fn civitai_pull_rejects_a_version_of_another_model() {
         "/api/v1/model-versions/67890",
         br#"{"id": 67890, "modelId": 999, "files": []}"#,
     );
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     let error = pull_civitai(&mut mirror, &upstream, Some(67890), &Selection::Primary).unwrap_err();
 
@@ -748,7 +751,7 @@ fn civitai_pull_goes_on_without_the_description_of_the_model() {
         .lock()
         .unwrap()
         .remove("/api/v1/models/12345");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let site = Site::new(&upstream.base(), None);
 
     let mut warnings = Vec::new();
@@ -792,7 +795,7 @@ fn civitai_pull_does_not_send_the_token_to_another_host() {
         .as_bytes(),
     );
     upstream.route("/api/v1/models/12345", br#"{"id": 12345}"#);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     // The download URL of a test server is not https, which the site client
     // refuses for another host; go through the mirror's own fetch instead.
@@ -808,7 +811,7 @@ fn the_same_content_from_two_sources_is_stored_once() {
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
     site_with_model(&upstream);
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
 
     pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
     let pulled = pull_civitai(&mut mirror, &upstream, None, &Selection::Primary).unwrap();
@@ -822,7 +825,7 @@ fn gc_removes_blobs_no_snapshot_uses() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
     // A blob that was stored without any snapshot coming to use it.
     let orphan = Sha256::of(b"orphan");
@@ -889,7 +892,7 @@ fn gc_reports_what_database_and_directory_disagree_on() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     hub_with_repo(&upstream, COMMIT, "main");
-    let mut mirror = Mirror::open(dir.path()).unwrap();
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
     let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
     let weights = Sha256::of(b"weights");
     mirror.store.remove(&weights).unwrap();
@@ -911,6 +914,10 @@ fn gc_reports_what_database_and_directory_disagree_on() {
     assert_eq!(collected.missing, missing);
     assert!(stray_path.exists());
     assert_eq!(collected.untracked, std::slice::from_ref(&stray_path));
+    // Nodes see at once that the file is no longer fetched.
+    let file = &hf_snapshot(&mirror, COMMIT)["files"][2];
+    assert_eq!(file["path"], "vae/model.safetensors");
+    assert_eq!(file["fetched"], false);
 
     // The blob is forgotten, so there is nothing left to report, and the
     // next pull downloads the file again.
@@ -921,4 +928,133 @@ fn gc_reports_what_database_and_directory_disagree_on() {
     assert_eq!(pulled.downloaded, 1);
     assert_eq!(blob(&mirror, b"weights").unwrap(), b"weights");
     assert_eq!(mirror.gc(Duration::ZERO, false).unwrap().missing, []);
+}
+
+#[test]
+fn a_mirror_is_opened_only_where_one_was_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("mirror");
+
+    let error = Mirror::open(&root).unwrap_err().to_string();
+    assert!(error.contains("mvault mirror init"), "{error}");
+    assert!(!root.exists());
+
+    let (_, created) = Mirror::create(&root).unwrap();
+    assert!(created);
+    assert!(root.join("private/mvault.db").is_file());
+    let (_, created) = Mirror::create(&root).unwrap();
+    assert!(!created);
+    Mirror::open(&root).unwrap();
+}
+
+#[test]
+fn hf_pull_goes_on_after_a_file_that_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    upstream
+        .routes
+        .lock()
+        .unwrap()
+        .remove(&format!("/{REPO}/resolve/{COMMIT}/assets/sample.mp4"));
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
+    let hub = Hub::new(&upstream.base(), None);
+    let excludes = Excludes::default();
+    let mut log = Vec::new();
+
+    let result = mirror.pull_hf(
+        &http(),
+        &HfPull {
+            hub: &hub,
+            host: HOST,
+            repo: REPO,
+            revision: "main",
+            excludes: &excludes,
+        },
+        &mut |event| match event {
+            Event::Started { path, .. } => log.push(path.to_owned()),
+            Event::Finished(outcome) => log.push(format!("{outcome:?}")),
+            Event::Failed(_) => log.push("failed".to_owned()),
+            Event::Progress(_) | Event::Warning(_) => {}
+        },
+    );
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.starts_with("1 of 3 file(s) could not be fetched:\n  assets/sample.mp4: "),
+        "{error}"
+    );
+    assert_eq!(
+        log,
+        [
+            "assets/sample.mp4",
+            "failed",
+            "config.json",
+            "Downloaded",
+            "vae/model.safetensors",
+            "Downloaded"
+        ]
+    );
+    assert_eq!(blob(&mirror, b"weights").unwrap(), b"weights");
+    let files = &hf_snapshot(&mirror, COMMIT)["files"];
+    assert_eq!(files[0]["fetched"], false);
+    assert_eq!(files[2].get("fetched"), None);
+    // The name does not move to a snapshot that lacks a file.
+    assert!(
+        !mirror
+            .public_dir()
+            .join(format!("snapshots/hf/{HOST}/{REPO}/refs/main"))
+            .exists()
+    );
+}
+
+#[test]
+fn export_writes_the_public_tree_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
+    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    let snapshot = hf_snapshot(&mirror, COMMIT);
+    fs::remove_dir_all(mirror.public_dir().join("snapshots")).unwrap();
+
+    assert_eq!(mirror.export_all().unwrap(), 1);
+
+    assert_eq!(hf_snapshot(&mirror, COMMIT), snapshot);
+    assert_eq!(
+        fs::read_to_string(
+            mirror
+                .public_dir()
+                .join(format!("snapshots/hf/{HOST}/{REPO}/refs/main"))
+        )
+        .unwrap(),
+        format!("{COMMIT}\n")
+    );
+}
+
+#[test]
+fn gc_reports_a_digest_out_of_its_place_and_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
+    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    let weights = Sha256::of(b"weights").to_string();
+    let blob_path = mirror.store.blob_path(&Sha256::of(b"weights"));
+    let shards = blob_path.parent().unwrap().parent().unwrap();
+    let wrong = shards
+        .join(if weights.starts_with("00") {
+            "01"
+        } else {
+            "00"
+        })
+        .join(&weights);
+    fs::create_dir_all(wrong.parent().unwrap()).unwrap();
+    fs::copy(&blob_path, &wrong).unwrap();
+
+    let collected = mirror.gc(Duration::ZERO, false).unwrap();
+
+    assert_eq!(collected.untracked, std::slice::from_ref(&wrong));
+    assert!(wrong.exists());
+    assert!(blob_path.exists());
 }

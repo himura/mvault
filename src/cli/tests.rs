@@ -89,7 +89,9 @@ struct Run {
     hosts: Vec<String>,
 }
 
+/// Runs `mvault mirror --root <root> <args>`, on a mirror made beforehand.
 fn run(upstream: &Upstream, root: &Path, env: &[(&str, &str)], args: &[&str]) -> Run {
+    crate::mirror::Mirror::create(root).unwrap();
     let mut command = vec!["mirror", "--root", root.to_str().unwrap()];
     command.extend(args);
     run_in(upstream, &std::env::temp_dir(), env, &command)
@@ -373,11 +375,11 @@ fn rejects_arguments_that_do_not_fit_the_source() {
         ),
         (
             vec!["pull", "civitai:example.com:12345", "--exclude", "x"],
-            "--revision and --exclude are for repositories",
+            "--revision, --exclude and --exclude-regexp are for repositories",
         ),
         (
             vec!["pull", "civitai:example.com:12345", "--revision", "main"],
-            "--revision and --exclude are for repositories",
+            "--revision, --exclude and --exclude-regexp are for repositories",
         ),
         (
             vec![
@@ -413,8 +415,21 @@ fn rejects_arguments_that_do_not_fit_the_source() {
             "invalid source",
         ),
         (
-            vec!["pull", "hf:example-org/example-model", "--exclude", "/(/"],
-            "invalid exclude pattern",
+            vec!["pull", "hf:example-org/example-model", "--exclude", "a["],
+            "invalid exclude glob",
+        ),
+        (
+            vec![
+                "pull",
+                "hf:example-org/example-model",
+                "--exclude-regexp",
+                "(",
+            ],
+            "invalid exclude regular expression",
+        ),
+        (
+            vec!["pull", "civitai:example.com:12345", "--exclude-regexp", "x"],
+            "--exclude-regexp are for repositories",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -613,7 +628,7 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
     let dir = tempfile::tempdir().unwrap();
     let upstream = Upstream::start();
     let workspace = mirror_and_workspace(&upstream, dir.path());
-    let add = |dest: &str, path: &str| {
+    let add = |dest: &str, key: &str, path: &str| {
         run_in(
             &upstream,
             &workspace,
@@ -623,13 +638,13 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
                 "hf:example-org/example-model",
                 "--dest",
                 dest,
-                "--path",
+                key,
                 path,
             ],
         )
     };
 
-    add("models/x/", "config.json").result.unwrap();
+    add("models/x/", "--path", "config.json").result.unwrap();
     fs::create_dir_all(workspace.join("models/x")).unwrap();
     fs::write(workspace.join("models/x/config.json"), b"mine").unwrap();
     let conflict = run_in(&upstream, &workspace, &[], &["sync"]);
@@ -653,7 +668,7 @@ fn sync_reports_conflicts_and_a_missing_file_as_errors() {
         b"{}"
     );
 
-    add("models/assets/", "assets/*").result.unwrap();
+    add("models/assets/", "--glob", "assets/*").result.unwrap();
     let missing = run_in(&upstream, &workspace, &[], &["sync"]);
     let error = missing.result.unwrap_err().to_string();
     assert!(
@@ -847,12 +862,23 @@ fn gc_removes_blobs_of_files_that_were_pruned() {
     );
 
     fs::remove_file(workspace.join("x/config.json")).unwrap();
-    let would = run_in(&upstream, &workspace, &[], &["gc", "--dry-run"]);
+    // The last link went away just now: kept for a day by default.
+    let recent = run_in(&upstream, &workspace, &[], &["gc"]);
+    assert_eq!(
+        recent.out,
+        "removed 0 blob(s) (0 B), 0 unfinished download(s)\n"
+    );
+    let would = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["gc", "--dry-run", "--min-age", "0"],
+    );
     assert_eq!(
         would.out,
         "would remove 1 blob(s) (2 B), 0 unfinished download(s)\n"
     );
-    let removed = run_in(&upstream, &workspace, &[], &["gc"]);
+    let removed = run_in(&upstream, &workspace, &[], &["gc", "--min-age", "0"]);
     assert_eq!(
         removed.out,
         "removed 1 blob(s) (2 B), 0 unfinished download(s)\n"
@@ -864,4 +890,66 @@ fn gc_removes_blobs_of_files_that_were_pruned() {
         synced.out,
         "0 resolved, 1 fetched, 1 linked, 0 unchanged, 0 pruned (done)\n"
     );
+}
+
+#[test]
+fn mirror_commands_other_than_init_need_a_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let root = dir.path().join("typo");
+    let mirror = |args: &[&str]| {
+        let mut command = vec!["mirror", "--root", root.to_str().unwrap()];
+        command.extend(args);
+        run_in(&upstream, dir.path(), &[], &command)
+    };
+
+    for args in [
+        &["gc"][..],
+        &["gc", "-n"],
+        &["export"],
+        &["pull", "hf:example-org/example-model"],
+    ] {
+        let error = mirror(args).result.unwrap_err().to_string();
+        assert!(error.contains("is not a mirror"), "{args:?}: {error}");
+        assert!(!root.exists(), "{args:?}");
+    }
+
+    let init = mirror(&["init"]);
+    init.result.unwrap();
+    assert_eq!(
+        init.out,
+        format!("created a mirror in {}\n", root.display())
+    );
+    let again = mirror(&["init"]);
+    assert_eq!(
+        again.out,
+        format!("{} is already a mirror\n", root.display())
+    );
+    let export = mirror(&["export"]);
+    export.result.unwrap();
+    assert_eq!(export.out, "wrote 0 snapshot(s)\n");
+}
+
+#[test]
+fn init_writes_a_relative_mirror_as_an_absolute_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+
+    run_in(
+        &upstream,
+        dir.path(),
+        &[],
+        &["init", "mlenv", "--mirror", "vault/public"],
+    )
+    .result
+    .unwrap();
+
+    let settings = fs::read_to_string(dir.path().join("mlenv/.mvault/config.toml")).unwrap();
+    let expected = toml::Value::String(
+        dir.path()
+            .join("vault/public")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(settings, format!("mirrors = [{expected}]\n"));
 }

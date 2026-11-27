@@ -302,7 +302,7 @@ fn check_revision(revision: &str) -> Result<(), Reason> {
 
 /// Reduces a `host[:port]` to its one spelling (see [`Source`]) and checks
 /// that it only has characters that are safe in a directory name.
-fn normalize_host(host: &str) -> Result<String, Reason> {
+pub(crate) fn normalize_host(host: &str) -> Result<String, Reason> {
     let invalid = || format!("invalid host {host:?}");
     let lower = host.to_ascii_lowercase();
     let (name, port) = match lower.split_once(':') {

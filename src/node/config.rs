@@ -14,6 +14,7 @@ use super::manifest::STATE_DIR;
 use crate::auth::Env;
 use crate::error::{Error, Result};
 use crate::fsutil::io_error;
+use crate::source::normalize_host;
 
 /// The settings in effect for a workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,16 +58,34 @@ impl Config {
     pub fn load(global: Option<&Path>, workspace: &Path) -> Result<Self> {
         let mut config = Self::default();
         if let Some(global) = global {
-            config.apply(read(global)?, workspace);
+            config.apply(read(global)?, workspace, false, global)?;
         }
         let local = workspace.join(STATE_DIR).join("config.toml");
-        config.apply(read(&local)?, workspace);
+        config.apply(read(&local)?, workspace, true, &local)?;
         Ok(config)
     }
 
-    fn apply(&mut self, raw: RawConfig, workspace: &Path) {
+    fn apply(&mut self, raw: RawConfig, workspace: &Path, local: bool, file: &Path) -> Result<()> {
+        let invalid = |reason: String| Error::Invalid(format!("{}: {reason}", file.display()));
         if let Some(mirrors) = raw.mirrors {
-            self.mirrors = mirrors;
+            let mut resolved = Vec::new();
+            for mirror in mirrors {
+                // A relative path means the same from wherever mvault runs:
+                // from the workspace, like `blobs`. The settings of the node
+                // serve every workspace, so there it has no meaning.
+                let is_path = !mirror.contains("://");
+                if is_path && !Path::new(&mirror).has_root() && !mirror.is_empty() {
+                    if !local {
+                        return Err(invalid(format!(
+                            "mirror {mirror:?} is a relative path; give an absolute one"
+                        )));
+                    }
+                    resolved.push(workspace.join(&mirror).to_string_lossy().into_owned());
+                } else {
+                    resolved.push(mirror);
+                }
+            }
+            self.mirrors = resolved;
         }
         if let Some(allow_official) = raw.allow_official {
             self.allow_official = allow_official;
@@ -76,8 +95,12 @@ impl Config {
             self.blobs = Some(workspace.join(blobs));
         }
         if let Some(host) = raw.civitai.default_host {
+            // Compared with the host of a source, which is written one way.
+            let host =
+                normalize_host(&host).map_err(|e| invalid(format!("civitai.default_host: {e}")))?;
             self.civitai_host = Some(host);
         }
+        Ok(())
     }
 }
 
@@ -156,6 +179,56 @@ mod tests {
         assert!(local.allow_official);
         assert_eq!(local.blobs, Some(workspace.join("shared/blobs")));
         assert_eq!(local.civitai_host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn a_relative_mirror_is_meant_from_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        write(
+            &workspace.join(".mvault/config.toml"),
+            "mirrors = [\"../vault/public\", \"https://mirror.example.internal\"]\n",
+        );
+        let config = Config::load(None, &workspace).unwrap();
+        assert_eq!(
+            config.mirrors,
+            [
+                workspace
+                    .join("../vault/public")
+                    .to_string_lossy()
+                    .into_owned(),
+                "https://mirror.example.internal".to_owned()
+            ]
+        );
+
+        let global = dir.path().join("global.toml");
+        write(&global, "mirrors = [\"vault/public\"]\n");
+        let error = Config::load(Some(&global), &workspace)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("relative path"), "{error}");
+    }
+
+    #[test]
+    fn the_default_host_is_written_one_way() {
+        let dir = tempfile::tempdir().unwrap();
+        for (written, expected) in [
+            ("Example.com", "example.com"),
+            ("example.com:443", "example.com"),
+            ("example.com:8443", "example.com:8443"),
+        ] {
+            write(
+                &dir.path().join(".mvault/config.toml"),
+                &format!("[civitai]\ndefault_host = \"{written}\"\n"),
+            );
+            let config = Config::load(None, dir.path()).unwrap();
+            assert_eq!(config.civitai_host.as_deref(), Some(expected), "{written}");
+        }
+        write(
+            &dir.path().join(".mvault/config.toml"),
+            "[civitai]\ndefault_host = \"bad host\"\n",
+        );
+        assert!(Config::load(None, dir.path()).is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod config;
 pub mod gc;
 pub mod lock;
 pub mod manifest;
+pub mod placed;
 pub mod plan;
 pub mod remote;
 pub mod resolve;

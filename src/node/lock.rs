@@ -14,7 +14,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::fsutil::{io_error, write_atomic};
+use crate::fsutil::{check_relative, io_error, write_atomic};
 use crate::hash::Sha256;
 
 const VERSION: u32 = 1;
@@ -86,6 +86,14 @@ impl Lock {
                 "lock version {} is not supported (expected {VERSION})",
                 file.version
             )));
+        }
+        // The lock arrives from other nodes: a path in it must not lead a
+        // placement out of its destination.
+        for model in &file.model {
+            for locked in &model.files {
+                check_relative(&locked.path)
+                    .map_err(|reason| invalid(format!("{}: {reason}", model.source)))?;
+            }
         }
         Ok(Self { models: file.model })
     }
@@ -313,6 +321,8 @@ files = [
             "version = 1\nextra = true\n",
             "version = 1\n[[model]]\nsource = \"s\"\n",
             "version = 1\n[[model]]\nsource = \"s\"\nresolved = \"r\"\nfiles = [{ path = \"a\", sha256 = \"abc\" }]\n",
+            "version = 1\n[[model]]\nsource = \"s\"\nresolved = \"r\"\nfiles = [{ path = \"../a\" }]\n",
+            "version = 1\n[[model]]\nsource = \"s\"\nresolved = \"r\"\nfiles = [{ path = \"/etc/a\" }]\n",
             "not toml",
         ] {
             fs::write(&path, content).unwrap();

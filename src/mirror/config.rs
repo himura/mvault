@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::fsutil::io_error;
+use crate::source::normalize_host;
 
 /// The settings of a mirror. Every one of them is optional, and so is the
 /// file.
@@ -42,7 +43,14 @@ impl Config {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(io_error(&path)(error)),
         };
-        toml::from_str(&text).map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))
+        let invalid = |reason: String| Error::Invalid(format!("{}: {reason}", path.display()));
+        let mut config: Self = toml::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+        // Compared with the host of a source, which is written one way.
+        if let Some(host) = &config.civitai.default_host {
+            config.civitai.default_host =
+                Some(normalize_host(host).map_err(|e| invalid(format!("default_host: {e}")))?);
+        }
+        Ok(config)
     }
 }
 
@@ -71,6 +79,19 @@ mod tests {
     fn the_default_host_is_read() {
         let config = load(Some("[civitai]\ndefault_host = \"example.com\"\n")).unwrap();
         assert_eq!(config.civitai.default_host.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn the_default_host_is_written_one_way() {
+        for written in ["Example.com", "example.com:443", "EXAMPLE.COM"] {
+            let config = load(Some(&format!("[civitai]\ndefault_host = \"{written}\"\n"))).unwrap();
+            assert_eq!(
+                config.civitai.default_host.as_deref(),
+                Some("example.com"),
+                "{written}"
+            );
+        }
+        assert!(load(Some("[civitai]\ndefault_host = \"bad host\"\n")).is_err());
     }
 
     #[test]

@@ -49,8 +49,12 @@ struct MirrorArgs {
 
 #[derive(Debug, Subcommand)]
 enum MirrorCommand {
+    /// Make a directory a mirror
+    Init,
     /// Fetch a repository or a model version from its upstream
     Pull(PullArgs),
+    /// Write the files nodes read again, from the database of the mirror
+    Export,
     /// Remove the blobs no snapshot uses, and unfinished downloads
     Gc(MirrorGcArgs),
 }
@@ -75,10 +79,14 @@ struct PullArgs {
     /// Branch, tag or commit of a repository [default: main]
     #[arg(long, value_name = "REVISION")]
     revision: Option<String>,
-    /// Do not fetch the files of a repository matching this glob, or
-    /// `/regex/` (repeatable)
-    #[arg(long, value_name = "PATTERN")]
+    /// Do not fetch the files of a repository matching this glob, read as
+    /// in .gitignore (repeatable)
+    #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+    /// Do not fetch the files of a repository whose path matches this
+    /// regular expression (repeatable)
+    #[arg(long, value_name = "REGEXP")]
+    exclude_regexp: Vec<String>,
     /// Host of the upstream, for the two-word form of SOURCE
     #[arg(long, value_name = "HOST")]
     host: Option<String>,
@@ -131,7 +139,13 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
             match mirror.command {
+                MirrorCommand::Init => mirror_init(&root, context),
                 MirrorCommand::Pull(args) => pull(&root, &args, context),
+                MirrorCommand::Export => {
+                    let count = Mirror::open(&root)?.export_all()?;
+                    writeln!(context.out, "wrote {count} snapshot(s)")
+                        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+                }
                 MirrorCommand::Gc(args) => mirror_gc(&root, &args, context),
             }
         }
@@ -184,7 +198,7 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
                 host,
                 repo,
                 revision,
-                excludes: &Excludes::new(&args.exclude)?,
+                excludes: &Excludes::new(&args.exclude, &args.exclude_regexp)?,
             };
             mirror.pull_hf(&context.http, &pull, &mut |event| reporter.handle(event))?
         }
@@ -193,9 +207,12 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
             model_id,
             version_id,
         } => {
-            if args.revision.is_some() || !args.exclude.is_empty() {
+            if args.revision.is_some()
+                || !args.exclude.is_empty()
+                || !args.exclude_regexp.is_empty()
+            {
                 return Err(Error::Invalid(
-                    "--revision and --exclude are for repositories, not model versions".into(),
+                    "--revision, --exclude and --exclude-regexp are for repositories, not model versions".into(),
                 ));
             }
             let mut file_ids = args.file_id.clone();
@@ -238,6 +255,17 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
         "{source}@{revision}: {downloaded} downloaded, {reused} reused, {present} already present, {skipped} not fetched"
     )
     .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+fn mirror_init(root: &std::path::Path, context: &mut Context<'_>) -> Result<()> {
+    let (_, created) = Mirror::create(root)?;
+    let message = if created {
+        format!("created a mirror in {}", root.display())
+    } else {
+        format!("{} is already a mirror", root.display())
+    };
+    writeln!(context.out, "{message}")
+        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
 }
 
 fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<'_>) -> Result<()> {
@@ -356,6 +384,7 @@ impl Reporter<'_> {
                 Outcome::Reused => "reused",
                 Outcome::Present => "already present",
             }),
+            Event::Failed(message) => self.end(&format!("failed: {message}")),
             Event::Warning(message) => writeln!(self.err, "warning: {message}"),
         }
     }

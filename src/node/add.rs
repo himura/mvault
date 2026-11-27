@@ -19,8 +19,10 @@ pub struct Request<'a> {
     pub reference: &'a Reference,
     /// Where to place it: a directory (ending in `/`) or a file name.
     pub dest: &'a str,
-    /// Paths or globs of files of a repository, instead of all of it.
+    /// Paths of files of a repository, instead of all of it.
     pub paths: &'a [String],
+    /// Globs of files of a repository, instead of all of it.
+    pub globs: &'a [String],
     /// Ids of files of a model version, instead of the primary one.
     pub file_ids: &'a [u64],
     /// Branch, tag or commit of a repository.
@@ -56,6 +58,7 @@ pub enum Added {
 /// asked for, a destination is already used by another file, or the
 /// manifest file is not one the workspace reads.
 pub fn add(workspace: &Workspace, access: &Access<'_>, request: &Request<'_>) -> Result<Added> {
+    let _workspace = workspace.lock(true)?;
     let defaults = workspace.defaults();
     let mut manifest = Manifest::load(&workspace.root, &defaults)?;
     check_relative(request.file).map_err(Error::Invalid)?;
@@ -84,7 +87,11 @@ pub fn add(workspace: &Workspace, access: &Access<'_>, request: &Request<'_>) ->
         .map(|locked| locked.resolved.clone())
         .unwrap_or_default();
     // The model must have what the entry asks for, and the destinations
-    // must be free, before anything is written.
+    // must be free, before anything is written. Entries that are not
+    // resolved yet are the business of the next sync, not of this one.
+    manifest
+        .models
+        .retain(|other| lock.get(&other.key().0, other.key().1).is_some());
     manifest.models.push(model.clone());
     plan(&manifest, &lock)?;
 
@@ -146,7 +153,7 @@ fn entry_text(request: &Request<'_>) -> Result<String> {
         Source::HuggingFace { host, repo } => {
             if !request.file_ids.is_empty() {
                 return Err(Error::Invalid(
-                    "--file-id is for model versions; files of a repository are given with --path"
+                    "--file-id is for model versions; files of a repository are given with --path or --glob"
                         .into(),
                 ));
             }
@@ -173,12 +180,19 @@ fn entry_text(request: &Request<'_>) -> Result<String> {
                 .iter()
                 .chain(request.paths)
                 .map(|path| format!("  {{ path = {}, dest = {dest} }},", quote(path)))
+                .chain(
+                    request
+                        .globs
+                        .iter()
+                        .map(|glob| format!("  {{ glob = {}, dest = {dest} }},", quote(glob))),
+                )
                 .collect()
         }
         Source::Civitai { .. } => {
-            if !request.paths.is_empty() || request.revision.is_some() {
+            if !request.paths.is_empty() || !request.globs.is_empty() || request.revision.is_some()
+            {
                 return Err(Error::Invalid(
-                    "--path and --revision are for repositories; files of a model version are given with --file-id"
+                    "--path, --glob and --revision are for repositories; files of a model version are given with --file-id"
                         .into(),
                 ));
             }
@@ -226,6 +240,7 @@ mod tests {
     #[derive(Default, Clone, Copy)]
     struct Extra<'a> {
         paths: &'a [String],
+        globs: &'a [String],
         file_ids: &'a [u64],
         revision: Option<&'a str>,
         file: Option<&'a str>,
@@ -296,11 +311,13 @@ mod tests {
                 hub: &|_| Hub::new(&base, None),
                 site: &|_| Site::new(&base, None),
                 warnings: RefCell::default(),
+                down: RefCell::default(),
             };
             let request = Request {
                 reference: &reference,
                 dest,
                 paths: extra.paths,
+                globs: extra.globs,
                 file_ids: extra.file_ids,
                 revision: extra.revision,
                 file: extra.file.unwrap_or(MANIFEST_NAME),
@@ -345,14 +362,14 @@ mod tests {
     #[test]
     fn a_file_url_and_paths_become_a_list_of_files() {
         let world = World::new();
-        let paths = ["vae/*.safetensors".to_owned()];
+        let globs = ["vae/*.safetensors".to_owned()];
 
         world
             .add(
                 "https://huggingface.co/example-org/example-model/blob/dev/config.json",
                 "models/x/",
                 Extra {
-                    paths: &paths,
+                    globs: &globs,
                     ..none()
                 },
             )
@@ -362,7 +379,7 @@ mod tests {
             world.manifest(),
             "# my models\n\n[[model]]\nsource = \"hf:example-org/example-model\"\nrevision = \"dev\"\nfiles = [\n  \
              { path = \"config.json\", dest = \"models/x/\" },\n  \
-             { path = \"vae/*.safetensors\", dest = \"models/x/\" },\n]\n"
+             { glob = \"vae/*.safetensors\", dest = \"models/x/\" },\n]\n"
         );
     }
 
@@ -423,6 +440,24 @@ mod tests {
         assert_eq!(again, Added::AlreadyThere);
         assert_eq!((world.manifest(), world.lock()), (manifest, lock));
         assert_eq!(world.upstream.server.requests().len(), requests);
+    }
+
+    #[test]
+    fn an_entry_not_resolved_yet_does_not_stand_in_the_way() {
+        let world = World::new();
+        // The upstream does not know this one: only a sync would find out.
+        fs::write(
+            world.dir.path().join(MANIFEST_NAME),
+            "[[model]]\nsource = \"hf:example-org/unknown\"\ndest = \"models/x/\"\n",
+        )
+        .unwrap();
+
+        world
+            .add("hf:example-org/example-model", "models/y/", none())
+            .unwrap();
+
+        assert!(world.manifest().contains("example-org/example-model"));
+        assert!(!world.lock().contains("example-org/unknown"));
     }
 
     #[test]
@@ -536,7 +571,7 @@ mod tests {
                         ..none()
                     },
                 ),
-                "--path and --revision are for repositories",
+                "--path, --glob and --revision are for repositories",
             ),
             (
                 world.add(
@@ -547,7 +582,7 @@ mod tests {
                         ..none()
                     },
                 ),
-                "--path and --revision are for repositories",
+                "--path, --glob and --revision are for repositories",
             ),
             (
                 world.add(
