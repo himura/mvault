@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::source::DEFAULT_HF_HOST;
@@ -25,6 +25,7 @@ pub type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// nothing else in the tokens directory can get in the way.
 pub struct Tokens<'a> {
     env: Env<'a>,
+    dir: Option<PathBuf>,
     read: RefCell<HashMap<String, Option<String>>>,
 }
 
@@ -36,20 +37,22 @@ impl std::fmt::Debug for Tokens<'_> {
 }
 
 impl<'a> Tokens<'a> {
-    /// The tokens found through `env`; nothing is read yet.
+    /// The tokens in `tokens/` of the settings directory `config` (see
+    /// [`default_config_dir`]), and the hub's own through `env`; nothing is
+    /// read yet.
     #[must_use]
-    pub fn new(env: Env<'a>) -> Self {
+    pub fn new(config: Option<&Path>, env: Env<'a>) -> Self {
         Self {
             env,
+            dir: config.map(|config| config.join("tokens")),
             read: RefCell::default(),
         }
     }
 
     /// The token for `host`, written in its one spelling (lower case,
-    /// without port 443). It is the first line of the file
-    /// `$XDG_CONFIG_HOME/mvault/tokens/<host>` (by default
-    /// `~/.config/mvault/tokens/<host>`), with `_` in place of the `:`
-    /// before a port.
+    /// without port 443). It is the first line of the file `tokens/<host>`
+    /// of the settings directory, with `_` in place of the `:` before a
+    /// port.
     ///
     /// Without a file of its own, the default hub falls back to the hub's
     /// own settings: `HF_TOKEN`, else the file named by `HF_TOKEN_PATH`,
@@ -64,7 +67,7 @@ impl<'a> Tokens<'a> {
         if let Some(token) = self.read.borrow().get(host) {
             return Ok(token.clone());
         }
-        let mut token = match tokens_dir(self.env) {
+        let mut token = match &self.dir {
             Some(dir) => read_token(dir.join(file_name_of_host(host)))?,
             None => None,
         };
@@ -78,11 +81,23 @@ impl<'a> Tokens<'a> {
     }
 }
 
-fn tokens_dir(env: Env<'_>) -> Option<PathBuf> {
+/// The directory of mvault's own settings when none is given:
+/// `$XDG_CONFIG_HOME/mvault`, by default `~/.config/mvault`, where `~` is
+/// `HOME`, else `USERPROFILE`.
+#[must_use]
+pub fn default_config_dir(env: Env<'_>) -> Option<PathBuf> {
     let config = non_empty(env("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(non_empty(env("HOME"))?).join(".config")))?;
-    Some(config.join("mvault").join("tokens"))
+        .or_else(|| Some(home_dir(env)?.join(".config")))?;
+    Some(config.join("mvault"))
+}
+
+/// The home directory: `HOME`, else `USERPROFILE`, which Windows sets
+/// where it does not set `HOME`.
+fn home_dir(env: Env<'_>) -> Option<PathBuf> {
+    non_empty(env("HOME"))
+        .or_else(|| non_empty(env("USERPROFILE")))
+        .map(PathBuf::from)
 }
 
 /// The name of the token file of `host`: `_` in place of the `:` before a
@@ -103,7 +118,7 @@ fn hf_token(env: Env<'_>) -> Result<Option<String>> {
             let home = non_empty(env("HF_HOME")).map(PathBuf::from).or_else(|| {
                 let cache = non_empty(env("XDG_CACHE_HOME"))
                     .map(PathBuf::from)
-                    .or_else(|| Some(PathBuf::from(non_empty(env("HOME"))?).join(".cache")))?;
+                    .or_else(|| Some(home_dir(env)?.join(".cache")))?;
                 Some(cache.join("huggingface"))
             })?;
             Some(home.join("token"))
@@ -159,7 +174,7 @@ mod tests {
     #[test]
     fn nothing_set_means_no_token() {
         let env = env_of(&[]);
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(tokens.get(DEFAULT_HF_HOST).unwrap(), None);
         assert_eq!(tokens.get("example.com").unwrap(), None);
     }
@@ -177,7 +192,7 @@ mod tests {
         write(&tokens_dir.join("empty.example.com"), "\n");
 
         let env = env_of(&[("HOME", &home)]);
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(
             tokens.get("example.com").unwrap().as_deref(),
             Some("site-token")
@@ -197,8 +212,56 @@ mod tests {
             ("HOME", &home),
             ("XDG_CONFIG_HOME", &dir.path().join("xdg")),
         ]);
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(tokens.get("example.com").unwrap().as_deref(), Some("xdg"));
+    }
+
+    #[test]
+    fn the_default_config_dir_is_found_through_the_environment() {
+        let dir = |vars: &[(&str, &Path)]| default_config_dir(&env_of(vars));
+        assert_eq!(dir(&[]), None);
+        assert_eq!(
+            dir(&[("HOME", Path::new("/home/user"))]),
+            Some(PathBuf::from("/home/user/.config/mvault"))
+        );
+        assert_eq!(
+            dir(&[("USERPROFILE", Path::new("/profile"))]),
+            Some(PathBuf::from("/profile/.config/mvault"))
+        );
+        assert_eq!(
+            dir(&[
+                ("HOME", Path::new("/home/user")),
+                ("XDG_CONFIG_HOME", Path::new("/xdg"))
+            ]),
+            Some(PathBuf::from("/xdg/mvault"))
+        );
+    }
+
+    #[test]
+    fn without_home_the_user_profile_is_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        write(&profile.join(".config/mvault/tokens/example.com"), "site");
+        write(&profile.join(".cache/huggingface/token"), "hub-cli");
+        let env = env_of(&[("USERPROFILE", &profile)]);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
+        assert_eq!(tokens.get("example.com").unwrap().as_deref(), Some("site"));
+        assert_eq!(
+            tokens.get(DEFAULT_HF_HOST).unwrap().as_deref(),
+            Some("hub-cli")
+        );
+
+        // HOME, when set, comes first.
+        let env = env_of(&[
+            ("USERPROFILE", &profile),
+            ("HOME", &dir.path().join("home")),
+        ]);
+        assert_eq!(
+            Tokens::new(default_config_dir(&env).as_deref(), &env)
+                .get("example.com")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -217,7 +280,7 @@ mod tests {
             ("XDG_CONFIG_HOME", dir.path()),
             ("HF_TOKEN_PATH", &dir.path().join("hf-token")),
         ]);
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(tokens.get("example.com").unwrap().as_deref(), Some("token"));
         // Asked for, a host whose file is unreadable is an error.
         assert!(tokens.get("old").is_err());
@@ -232,7 +295,7 @@ mod tests {
         fs::create_dir_all(&tokens_dir).unwrap();
         std::os::unix::fs::symlink("a.example.com", tokens_dir.join("b.example.com")).unwrap();
         let env = env_of(&[("XDG_CONFIG_HOME", dir.path())]);
-        let error = Tokens::new(&env)
+        let error = Tokens::new(default_config_dir(&env).as_deref(), &env)
             .get("b.example.com")
             .err()
             .unwrap()
@@ -241,7 +304,7 @@ mod tests {
 
         // A link to a file is how hosts share a token.
         write(&tokens_dir.join("a.example.com"), "shared");
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(
             tokens.get("b.example.com").unwrap().as_deref(),
             Some("shared")
@@ -254,7 +317,7 @@ mod tests {
         let home = dir.path().join("home");
         write(&home.join(".cache/huggingface/token"), "hub-cli\n");
         let env = env_of(&[("HOME", &home), ("HF_TOKEN", Path::new("from-env"))]);
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(
             tokens.get(DEFAULT_HF_HOST).unwrap().as_deref(),
             Some("from-env")
@@ -264,7 +327,7 @@ mod tests {
 
         // A file of mvault's own wins.
         write(&home.join(".config/mvault/tokens/huggingface.co"), "own");
-        let tokens = Tokens::new(&env);
+        let tokens = Tokens::new(default_config_dir(&env).as_deref(), &env);
         assert_eq!(tokens.get(DEFAULT_HF_HOST).unwrap().as_deref(), Some("own"));
     }
 

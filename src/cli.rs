@@ -1,12 +1,12 @@
 //! The command line.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::auth::{Env, Tokens};
+use crate::auth::{Env, Tokens, default_config_dir};
 use crate::download::{Client, Progress};
 use crate::error::{Error, Result};
 use crate::mirror::config::Config;
@@ -20,6 +20,10 @@ use crate::upstream::hf::Hub;
 #[derive(Debug, Parser)]
 #[command(name = "mvault", version)]
 pub struct Cli {
+    /// Directory of the settings and tokens of mvault
+    /// (by default mvault in the config directory of the user)
+    #[arg(long, env = "MVAULT_CONFIG_DIR", global = true, value_name = "DIR")]
+    config_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -129,18 +133,34 @@ impl std::fmt::Debug for Context<'_> {
 ///
 /// Returns the error of the command.
 pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
+    let config_dir = match cli.config_dir {
+        Some(dir) => {
+            let dir = context.cwd.join(dir);
+            // Given on purpose, so a mistyped one must not pass for an
+            // empty one.
+            if !dir.is_dir() {
+                return Err(Error::Invalid(format!(
+                    "{}: the settings directory (--config-dir, MVAULT_CONFIG_DIR) is not a directory",
+                    dir.display()
+                )));
+            }
+            Some(dir)
+        }
+        None => default_config_dir(context.env),
+    };
+    let config_dir = config_dir.as_deref();
     match cli.command {
         Command::Init(args) => node::init(&args, context),
-        Command::Add(args) => node::add(&args, context),
-        Command::Sync(args) => node::sync(&args, context),
-        Command::Gc(args) => node::gc(&args, context),
+        Command::Add(args) => node::add(&args, config_dir, context),
+        Command::Sync(args) => node::sync(&args, config_dir, context),
+        Command::Gc(args) => node::gc(&args, config_dir, context),
         Command::Mirror(mirror) => {
             let root = mirror.root.ok_or_else(|| {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
             match mirror.command {
                 MirrorCommand::Init => mirror_init(&root, context),
-                MirrorCommand::Pull(args) => pull(&root, &args, context),
+                MirrorCommand::Pull(args) => pull(&root, &args, config_dir, context),
                 MirrorCommand::Export => {
                     let count = Mirror::open(&root)?.export_all()?;
                     writeln!(context.out, "wrote {count} snapshot(s)")
@@ -152,14 +172,19 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
     }
 }
 
-fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> Result<()> {
+fn pull(
+    root: &Path,
+    args: &PullArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
     let config = Config::load(root)?;
     let default_civitai_host = config.civitai.default_host;
     let reference = parse_source(args, default_civitai_host.as_deref())?;
     let mut mirror = Mirror::open(root)?;
     // Any https URL of the right shape is taken for a site of its kind, so
     // a token goes only to the host its file is named by.
-    let tokens = Tokens::new(context.env);
+    let tokens = Tokens::new(config_dir, context.env);
     let mut reporter = Reporter {
         err: &mut *context.err,
         live: context.live,

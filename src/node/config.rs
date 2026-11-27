@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::manifest::STATE_DIR;
-use crate::auth::Env;
 use crate::error::{Error, Result};
 use crate::fsutil::io_error;
 use crate::source::normalize_host;
@@ -103,17 +102,11 @@ impl Config {
     }
 }
 
-/// The path of the settings of the node: `$XDG_CONFIG_HOME/mvault/config.toml`,
-/// by default `~/.config/mvault/config.toml`.
+/// The path of the settings of the node in the settings directory
+/// `config` (see [`crate::auth::default_config_dir`]).
 #[must_use]
-pub fn global_path(env: Env<'_>) -> Option<PathBuf> {
-    let set = |name: &str| {
-        env(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    let config = set("XDG_CONFIG_HOME").or_else(|| Some(set("HOME")?.join(".config")))?;
-    Some(config.join("mvault").join("config.toml"))
+pub fn global_path(config: &Path) -> PathBuf {
+    config.join("config.toml")
 }
 
 fn read(path: &Path) -> Result<RawConfig> {
@@ -236,25 +229,5 @@ mod tests {
         write(&dir.path().join(".mvault/config.toml"), "mirror = \"x\"\n");
         let error = Config::load(None, dir.path()).unwrap_err().to_string();
         assert!(error.contains("config.toml"), "{error}");
-    }
-
-    #[test]
-    fn the_node_settings_are_found_through_the_environment() {
-        let env = |vars: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                vars.iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| (*value).to_owned())
-            }
-        };
-        assert_eq!(global_path(&env(&[])), None);
-        assert_eq!(
-            global_path(&env(&[("HOME", "/home/user")])),
-            Some(PathBuf::from("/home/user/.config/mvault/config.toml"))
-        );
-        assert_eq!(
-            global_path(&env(&[("HOME", "/home/user"), ("XDG_CONFIG_HOME", "/xdg")])),
-            Some(PathBuf::from("/xdg/mvault/config.toml"))
-        );
     }
 }
