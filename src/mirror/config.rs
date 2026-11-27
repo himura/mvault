@@ -24,8 +24,7 @@ pub struct Config {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CivitaiConfig {
-    /// The host assumed when a source does not name one. It is also the only
-    /// host the token is sent to.
+    /// The host assumed when a source does not name one.
     pub default_host: Option<String>,
 }
 
@@ -45,7 +44,7 @@ impl Config {
         };
         let invalid = |reason: String| Error::Invalid(format!("{}: {reason}", path.display()));
         let mut config: Self = toml::from_str(&text).map_err(|e| invalid(e.to_string()))?;
-        // Compared with the host of a source, which is written one way.
+        // Taken into sources, which spell a host one way.
         if let Some(host) = &config.civitai.default_host {
             config.civitai.default_host =
                 Some(normalize_host(host).map_err(|e| invalid(format!("default_host: {e}")))?);

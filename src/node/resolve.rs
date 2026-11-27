@@ -22,9 +22,9 @@ pub struct Access<'a> {
     /// The mirrors, in the order to try them.
     pub remotes: &'a [Remote],
     /// The client for the hub on a host.
-    pub hub: &'a dyn Fn(&str) -> Hub,
+    pub hub: &'a dyn Fn(&str) -> Result<Hub>,
     /// The client for the site on a host.
-    pub site: &'a dyn Fn(&str) -> Site,
+    pub site: &'a dyn Fn(&str) -> Result<Site>,
     /// Problems that did not stop the work, such as a mirror that could not
     /// be read while another one could.
     pub warnings: RefCell<Vec<String>>,
@@ -220,7 +220,7 @@ fn read_snapshot(source: &Source, revision: &str, access: &Access<'_>) -> Option
 fn from_upstream(model: &Model, access: &Access<'_>) -> Result<(String, Vec<LockedFile>)> {
     match &model.source {
         Source::HuggingFace { host, repo } => {
-            let hub = (access.hub)(host);
+            let hub = (access.hub)(host)?;
             let revision = model.revision.as_deref().unwrap_or_default();
             let info = hub.repo_info(access.http, repo, revision)?;
             let files = info
@@ -241,7 +241,7 @@ fn from_upstream(model: &Model, access: &Access<'_>) -> Result<(String, Vec<Lock
             model_id,
             version_id,
         } => {
-            let site = (access.site)(host);
+            let site = (access.site)(host)?;
             let version_id = match version_id {
                 Some(version_id) => *version_id,
                 None => site

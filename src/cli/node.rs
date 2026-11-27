@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use super::{Context, Reporter};
-use crate::auth;
+use crate::auth::Tokens;
 use crate::error::{Error, Result};
 use crate::node::add::{self, Added};
 use crate::node::config::global_path;
@@ -14,7 +14,7 @@ use crate::node::manifest::MANIFEST_NAME;
 use crate::node::resolve::Access;
 use crate::node::sync::{self, Event, Options};
 use crate::node::workspace::{self, Workspace};
-use crate::source::{DEFAULT_HF_HOST, Reference};
+use crate::source::Reference;
 use crate::upstream::civitai::Site;
 use crate::upstream::hf::Hub;
 
@@ -259,23 +259,13 @@ fn with_access<T>(
 ) -> Result<T> {
     let remotes = workspace.remotes()?;
     // Each token is for one host only; see `mvault mirror pull`.
-    let hf_token = auth::hf_token(context.env)?;
-    let civitai_token = auth::civitai_token(context.env)?;
-    let civitai_host = workspace.config.civitai_host.clone();
+    let tokens = Tokens::new(context.env);
     let base_url = context.base_url;
     let access = Access {
         http: &context.http,
         remotes: &remotes,
-        hub: &|host| {
-            let token = hf_token.as_deref().filter(|_| host == DEFAULT_HF_HOST);
-            Hub::new(&base_url(host), token)
-        },
-        site: &|host| {
-            let token = civitai_token
-                .as_deref()
-                .filter(|_| civitai_host.as_deref() == Some(host));
-            Site::new(&base_url(host), token)
-        },
+        hub: &|host| Ok(Hub::new(&base_url(host), tokens.get(host)?.as_deref())),
+        site: &|host| Ok(Site::new(&base_url(host), tokens.get(host)?.as_deref())),
         warnings: RefCell::default(),
         down: RefCell::default(),
     };
