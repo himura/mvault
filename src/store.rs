@@ -115,14 +115,14 @@ impl BlobStore {
     pub fn remove(&self, digest: &Sha256) -> io::Result<()> {
         let path = self.blob_path(digest);
         let removed = fs::remove_file(&path).or_else(|error| {
-            if error.kind() != io::ErrorKind::PermissionDenied {
+            // On Unix whether a file can be removed depends on its directory
+            // alone. Its mode is shared with every file placed as a link to
+            // it, so it is not touched.
+            if cfg!(unix) || error.kind() != io::ErrorKind::PermissionDenied {
                 return Err(error);
             }
             // Where a read-only file cannot be removed as it is.
-            let mut permissions = fs::metadata(&path)?.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            fs::set_permissions(&path, permissions)?;
+            make_writable(&path)?;
             fs::remove_file(&path)
         });
         match removed {
@@ -453,6 +453,31 @@ mod tests {
 
         assert_eq!(prepared.commit().unwrap(), Committed::AlreadyPresent);
         assert!(!second.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_blob_that_cannot_be_removed_stays_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let digest = Sha256::of(b"abc");
+        store
+            .commit(&write_partial(&store, "one", b"abc"), &digest)
+            .unwrap();
+        let blob = store.blob_path(&digest);
+        let shard = blob.parent().unwrap().to_owned();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = store.remove(&digest);
+
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o755)).unwrap();
+        if result.is_ok() {
+            // Run by root, who may remove it all the same.
+            return;
+        }
+        let mode = fs::metadata(&blob).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
     }
 
     #[cfg(unix)]
