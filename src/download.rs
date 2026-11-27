@@ -23,7 +23,7 @@ pub const MAX_BODY_SIZE: u64 = 64 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Failures in a row, without any new data in between, that end the
-    /// download.
+    /// download. Bytes downloaded again after a failure are not new data.
     pub max_failures: u32,
     /// Pause after the first failure; doubled after each further one.
     pub initial_delay: Duration,
@@ -121,6 +121,18 @@ pub enum DownloadError {
         /// The size given in the request.
         expected: u64,
     },
+    /// The server's file has another size than the one given in the request,
+    /// as when the size was learned before the file changed. The destination
+    /// file is emptied.
+    #[error("{url}: expected {expected} bytes, the server has {actual}")]
+    SizeMismatch {
+        /// The requested URL.
+        url: String,
+        /// The size given in the request.
+        expected: u64,
+        /// The size the server announced.
+        actual: u64,
+    },
 }
 
 /// An HTTP client for downloads.
@@ -143,6 +155,8 @@ enum Failure {
     /// The server does not have the range after what the file holds, so the
     /// file is not a beginning of the content.
     Restart,
+    /// The server's file has another size than the request expects.
+    SizeMismatch(u64),
     Fatal(DownloadError),
 }
 
@@ -268,18 +282,44 @@ impl Client {
         });
 
         let mut failures = 0;
+        // Only bytes beyond the furthest point reached count as progress, so
+        // that downloading the same beginning again and again ends.
+        let mut furthest = target.len;
+        let mut restarted = false;
         while request.size != Some(target.len) {
-            let before = target.len;
             let reason = match self.attempt(request, &mut target, progress) {
                 Ok(()) => break,
                 Err(Failure::Fatal(error)) => return Err(error),
                 Err(Failure::Retry(reason)) => reason,
+                Err(Failure::SizeMismatch(actual)) => {
+                    target.clear()?;
+                    return Err(size_mismatch(request, actual));
+                }
+                Err(Failure::Restart) if restarted => {
+                    // Everything in the file came from this server, which now
+                    // says it has no more: its file is shorter than expected,
+                    // or it changed during the download.
+                    let len = target.len;
+                    target.clear()?;
+                    return Err(match request.size {
+                        Some(_) => size_mismatch(request, len),
+                        None => DownloadError::Failed {
+                            url: request.url.to_owned(),
+                            reason: "the server's file changed during the download".to_owned(),
+                        },
+                    });
+                }
                 Err(Failure::Restart) => {
+                    // The partial file left by an earlier attempt was not a
+                    // beginning of this one, so what it reached is no measure.
+                    restarted = true;
+                    furthest = 0;
                     target.clear()?;
                     "the server does not have the rest of the partial file".to_owned()
                 }
             };
-            if target.len > before {
+            if target.len > furthest {
+                furthest = target.len;
                 failures = 0;
             }
             failures += 1;
@@ -310,7 +350,9 @@ impl Client {
                 Ok(body) => return Ok(body),
                 Err(Failure::Fatal(error)) => return Err(error),
                 Err(Failure::Retry(reason)) => reason,
-                Err(Failure::Restart) => "unexpected HTTP status 416".to_owned(),
+                Err(Failure::Restart | Failure::SizeMismatch(_)) => {
+                    "unexpected HTTP status 416".to_owned()
+                }
             };
             failures += 1;
             if failures >= self.retry.max_failures {
@@ -394,27 +436,42 @@ impl Client {
         )?;
 
         let status = response.status().as_u16();
-        match status {
+        let content_range = response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok())
+            .map(ContentRange::parse);
+        // The size of the whole file on the server, if it says.
+        let announced = match status {
             200 => {
                 // The server ignored the range and sends everything.
                 if target.len > 0 {
                     target.clear().map_err(Failure::Fatal)?;
                 }
+                response.body().content_length()
             }
             206 => {
-                let start = response
-                    .headers()
-                    .get("content-range")
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(range_start);
-                if start != Some(target.len) {
+                let range = content_range.unwrap_or_default();
+                if range.start != Some(target.len) {
                     return Err(Failure::Retry(format!(
                         "asked for bytes from {}, got another range",
                         target.len
                     )));
                 }
+                range.total.or_else(|| {
+                    let rest = response.body().content_length()?;
+                    Some(target.len + rest)
+                })
             }
-            416 if target.len > 0 => return Err(Failure::Restart),
+            416 if target.len > 0 => {
+                let total = content_range.and_then(|range| range.total);
+                return match (total, request.size) {
+                    // The file was complete already.
+                    (Some(total), None) if total == target.len => Ok(()),
+                    (Some(total), Some(size)) if total != size => Err(Failure::SizeMismatch(total)),
+                    _ => Err(Failure::Restart),
+                };
+            }
             408 | 429 | 500..=599 => return Err(Failure::Retry(format!("HTTP status {status}"))),
             _ => {
                 return Err(Failure::Fatal(DownloadError::Status {
@@ -422,12 +479,16 @@ impl Client {
                     status,
                 }));
             }
-        }
+        };
 
-        let total = request.size.or_else(|| {
-            let rest = response.body().content_length()?;
-            Some(target.len + rest)
-        });
+        if let (Some(size), Some(announced)) = (request.size, announced)
+            && size != announced
+        {
+            // Reading on would only end in a file of the wrong size, and a
+            // beginning kept from before may be of an older version.
+            return Err(Failure::SizeMismatch(announced));
+        }
+        let total = request.size.or(announced);
         let mut reader = response.into_body().into_reader();
         let mut buffer = vec![0; BUFFER_SIZE];
         loop {
@@ -472,10 +533,40 @@ fn too_long(request: &Request<'_>, target: &mut Target<'_>, size: u64) -> Failur
     })
 }
 
-/// The first byte position of a `Content-Range: bytes <start>-<end>/<size>`.
-fn range_start(content_range: &str) -> Option<u64> {
-    let (start, _) = content_range.strip_prefix("bytes ")?.split_once('-')?;
-    start.trim().parse().ok()
+fn size_mismatch(request: &Request<'_>, actual: u64) -> DownloadError {
+    DownloadError::SizeMismatch {
+        url: request.url.to_owned(),
+        expected: request.size.unwrap_or_default(),
+        actual,
+    }
+}
+
+/// What a `Content-Range: bytes <start>-<end>/<size>` or
+/// `Content-Range: bytes */<size>` header says.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    /// The first byte position.
+    start: Option<u64>,
+    /// The size of the whole file, unless the server gave `*`.
+    total: Option<u64>,
+}
+
+impl ContentRange {
+    fn parse(value: &str) -> Self {
+        let Some((range, total)) = value
+            .strip_prefix("bytes ")
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            return Self::default();
+        };
+        let start = range
+            .split_once('-')
+            .and_then(|(start, _)| start.trim().parse().ok());
+        Self {
+            start,
+            total: total.trim().parse().ok(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -756,10 +847,159 @@ mod tests {
         let error = get(&server, &dest, Some(4000)).unwrap_err();
 
         assert!(
-            matches!(error, DownloadError::TooLong { expected: 4000, .. }),
+            matches!(
+                error,
+                DownloadError::SizeMismatch {
+                    expected: 4000,
+                    actual: 5000,
+                    ..
+                }
+            ),
             "{error}"
         );
         assert_eq!(fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_file_shorter_than_the_expected_size_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body = content();
+        let server = TestServer::start({
+            let body = body.clone();
+            move |request| Response::file(request, &body)
+        });
+
+        let error = get(&server, &dest, Some(6000)).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                DownloadError::SizeMismatch {
+                    expected: 6000,
+                    actual: 5000,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert_eq!(fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_complete_partial_file_shorter_than_the_expected_size_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body = content();
+        fs::write(&dest, &body).unwrap();
+        let server = TestServer::start({
+            let body = body.clone();
+            move |request| Response::file(request, &body)
+        });
+
+        let error = get(&server, &dest, Some(6000)).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                DownloadError::SizeMismatch {
+                    expected: 6000,
+                    actual: 5000,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(ranges(&server), [Some("bytes=5000-".to_owned())]);
+        assert_eq!(fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_partial_file_of_another_version_is_not_continued() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body = content();
+        fs::write(&dest, &body[..1234]).unwrap();
+        // The upstream file was replaced by a longer one since.
+        let replaced: Vec<u8> = body.iter().copied().chain([0; 1000]).collect();
+        let server = TestServer::start(move |request| Response::file(request, &replaced));
+
+        let error = get(&server, &dest, Some(5000)).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                DownloadError::SizeMismatch {
+                    expected: 5000,
+                    actual: 6000,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_complete_partial_file_of_unknown_size_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body = content();
+        fs::write(&dest, &body).unwrap();
+        let server = TestServer::start({
+            let body = body.clone();
+            move |request| Response::file(request, &body)
+        });
+
+        let downloaded = get(&server, &dest, None).unwrap();
+
+        assert_eq!(downloaded.sha256, Sha256::of(&body));
+        assert_eq!(downloaded.size, 5000);
+        assert_eq!(ranges(&server), [Some("bytes=5000-".to_owned())]);
+    }
+
+    #[test]
+    fn ends_when_the_server_keeps_refusing_to_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        fs::write(&dest, b"stale beginning").unwrap();
+        let body = content();
+        // Cuts every full response short and refuses every range, without
+        // saying how large its file is.
+        let server = TestServer::start(move |request| {
+            if request.header("range").is_some() {
+                Response::status(416)
+            } else {
+                Response::ok(&body).cut_after(2000)
+            }
+        });
+
+        let error = get(&server, &dest, None).unwrap_err();
+
+        assert!(matches!(error, DownloadError::Failed { .. }), "{error}");
+        assert_eq!(
+            ranges(&server),
+            [
+                Some("bytes=15-".to_owned()),
+                None,
+                Some("bytes=2000-".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn bytes_downloaded_again_are_not_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("partial");
+        let body = content();
+        // Ignores ranges and cuts every response at the same point.
+        let server = TestServer::start(move |_| Response::ok(&body).cut_after(2000));
+
+        let error = get(&server, &dest, None).unwrap_err();
+
+        assert!(matches!(error, DownloadError::Failed { .. }), "{error}");
+        assert_eq!(server.requests().len(), 3);
     }
 
     #[test]
@@ -767,9 +1007,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("partial");
         let body: Vec<u8> = (0..=255).cycle().take(3 * BUFFER_SIZE).collect();
+        // Without an announced length, the size is only found out by reading.
         let server = TestServer::start({
             let body = body.clone();
-            move |_| Response::ok(&body)
+            move |_| Response::ok(&body).without_length()
         });
 
         let mut largest = 0;
@@ -788,6 +1029,32 @@ mod tests {
         );
         assert!(largest <= 4000, "wrote {largest} bytes");
         assert_eq!(fs::read(&dest).unwrap(), b"");
+    }
+
+    #[test]
+    fn parses_content_range() {
+        assert_eq!(
+            ContentRange::parse("bytes 10-19/20"),
+            ContentRange {
+                start: Some(10),
+                total: Some(20)
+            }
+        );
+        assert_eq!(
+            ContentRange::parse("bytes */20"),
+            ContentRange {
+                start: None,
+                total: Some(20)
+            }
+        );
+        assert_eq!(
+            ContentRange::parse("bytes 10-19/*"),
+            ContentRange {
+                start: Some(10),
+                total: None
+            }
+        );
+        assert_eq!(ContentRange::parse("items 1-2/3"), ContentRange::default());
     }
 
     #[test]

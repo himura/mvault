@@ -31,6 +31,7 @@ pub(crate) struct Response {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     cut_after: Option<usize>,
+    without_length: bool,
 }
 
 impl Response {
@@ -46,6 +47,7 @@ impl Response {
             headers: Vec::new(),
             body: Vec::new(),
             cut_after: None,
+            without_length: false,
         }
     }
 
@@ -62,6 +64,13 @@ impl Response {
     /// Announces the whole body but closes the connection after `bytes` of it.
     pub(crate) fn cut_after(mut self, bytes: usize) -> Self {
         self.cut_after = Some(bytes);
+        self
+    }
+
+    /// Leaves out `Content-Length`, so that the body ends where the
+    /// connection does.
+    pub(crate) fn without_length(mut self) -> Self {
+        self.without_length = true;
         self
     }
 
@@ -176,10 +185,10 @@ fn serve(
     for (name, value) in &response.headers {
         head.push(format!("{name}: {value}\r\n"));
     }
-    head.push(format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        response.body.len()
-    ));
+    if !response.without_length {
+        head.push(format!("Content-Length: {}\r\n", response.body.len()));
+    }
+    head.push("Connection: close\r\n\r\n".to_owned());
     let sent = response.cut_after.unwrap_or(response.body.len());
     let mut stream = reader.into_inner();
     stream.write_all(head.concat().as_bytes())?;
