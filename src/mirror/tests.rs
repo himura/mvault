@@ -931,6 +931,31 @@ fn gc_reports_what_database_and_directory_disagree_on() {
 }
 
 #[test]
+fn gc_changes_nothing_while_the_blobs_cannot_be_seen() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    hub_with_repo(&upstream, COMMIT, "main");
+    let mut mirror = Mirror::create(dir.path()).unwrap().0;
+    pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    let snapshot = hf_snapshot(&mirror, COMMIT);
+    // As when the volume of the blobs is not mounted.
+    let blobs = dir.path().join("public/blobs");
+    let aside = dir.path().join("public/blobs-aside");
+    fs::rename(&blobs, &aside).unwrap();
+
+    for dry_run in [true, false] {
+        let error = mirror.gc(Duration::ZERO, dry_run).unwrap_err();
+        assert!(error.to_string().contains("is it mounted"), "{error}");
+    }
+
+    fs::rename(&aside, &blobs).unwrap();
+    assert_eq!(hf_snapshot(&mirror, COMMIT), snapshot);
+    assert_eq!(mirror.gc(Duration::ZERO, false).unwrap().missing, []);
+    let pulled = pull_hf(&mut mirror, &upstream, "main", &["assets"]).unwrap();
+    assert_eq!(pulled.downloaded, 0);
+}
+
+#[test]
 fn a_mirror_is_opened_only_where_one_was_made() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("mirror");

@@ -62,6 +62,44 @@ impl BlobStore {
         self.blob_path(digest).is_file()
     }
 
+    /// Whether the blob with this digest is stored, telling a blob that is
+    /// absent from one that cannot be looked at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be looked at for another reason
+    /// than that it does not exist.
+    pub fn find(&self, digest: &Sha256) -> io::Result<bool> {
+        let path = self.blob_path(digest);
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(with_path(&error, &path)),
+        }
+    }
+
+    /// Checks that the directory of the blobs is there, so that a store
+    /// that is not mounted is not taken for one whose blobs are gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory is missing or cannot be looked at.
+    pub fn check_present(&self) -> io::Result<()> {
+        let root = self.blobs.join("sha256");
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a directory", root.display()),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not there (is it mounted?)", root.display()),
+            )),
+            Err(error) => Err(with_path(&error, &root)),
+        }
+    }
+
     /// The directory of unfinished files.
     #[must_use]
     pub fn tmp_dir(&self) -> &Path {
