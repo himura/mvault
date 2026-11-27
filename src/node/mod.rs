@@ -11,4 +11,5 @@ pub mod plan;
 pub mod remote;
 pub mod resolve;
 pub mod sync;
+pub mod update;
 pub mod workspace;

@@ -47,6 +47,8 @@ enum Command {
     Add(node::AddArgs),
     /// Fetch and place the models of the manifest
     Sync(node::SyncArgs),
+    /// Resolve branches and latest versions again, into the lock file
+    Update(node::UpdateArgs),
     /// Remove the blobs of this node that no file is linked to
     Gc(node::GcArgs),
     /// Maintain a mirror (run on the host that stores it)
@@ -173,6 +175,7 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
         Command::Init(args) => node::init(&args, context),
         Command::Add(args) => node::add(&args, config_dir, context),
         Command::Sync(args) => node::sync(&args, config_dir, context),
+        Command::Update(args) => node::update(&args, config_dir, context),
         Command::Gc(args) => node::gc(&args, config_dir, context),
         Command::Mirror(mirror) => {
             let root = mirror.root.ok_or_else(|| {

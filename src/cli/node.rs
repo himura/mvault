@@ -13,6 +13,7 @@ use crate::node::config::global_path;
 use crate::node::manifest::MANIFEST_NAME;
 use crate::node::resolve::Access;
 use crate::node::sync::{self, Event, Options};
+use crate::node::update::{self, Outcome, Updated};
 use crate::node::workspace::{self, Workspace};
 use crate::source::Reference;
 use crate::upstream::civitai::Site;
@@ -78,6 +79,14 @@ pub(super) struct SyncArgs {
     /// that were written to
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct UpdateArgs {
+    /// Models to resolve again, as page URLs or canonical forms
+    /// [default: every model of the manifest]
+    #[arg(value_name = "SOURCE")]
+    sources: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +259,46 @@ pub(super) fn sync(
     } else {
         Err(Error::Invalid(problems.join("; ")))
     }
+}
+
+pub(super) fn update(
+    args: &UpdateArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
+    let sources = args
+        .sources
+        .iter()
+        .map(|text| {
+            Reference::parse(text, &workspace.defaults())
+                .map(|reference| reference.source)
+                .map_err(|e| Error::Invalid(e.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let updated = with_access(&workspace, config_dir, context, |access, _| {
+        update::update(&workspace, access, &sources)
+    })?;
+    let mut moved = false;
+    for Updated { model, outcome } in &updated {
+        let line = match outcome {
+            Outcome::Moved { before, after } => {
+                moved = true;
+                format!("{model}: {before} -> {after}")
+            }
+            Outcome::Resolved(after) => {
+                moved = true;
+                format!("{model}: resolved to {after}")
+            }
+            Outcome::Unchanged(after) => format!("{model}: still {after}"),
+            Outcome::Pinned => format!("{model}: pinned by the manifest"),
+        };
+        say(context, &line)?;
+    }
+    if moved {
+        say(context, "mvault sync places what changed")?;
+    }
+    Ok(())
 }
 
 fn open(config_dir: Option<&Path>, context: &Context<'_>) -> Result<Workspace> {

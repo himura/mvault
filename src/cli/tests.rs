@@ -1175,3 +1175,141 @@ fn mirror_ls_lists_snapshots_and_with_a_source_their_files() {
         "{error}"
     );
 }
+
+/// Makes `main` of the test repository stand for `commit`, with these
+/// files, and lets the mirror in `dir` pull it.
+fn move_main(upstream: &Upstream, dir: &Path, commit: &str, files: &[(&str, &[u8])]) {
+    let siblings: Vec<String> = files
+        .iter()
+        .map(|(path, content)| format!(r#"{{"rfilename": "{path}", "size": {}}}"#, content.len()))
+        .collect();
+    upstream.route(
+        "/api/models/example-org/example-model/revision/main?blobs=true",
+        format!(
+            r#"{{"sha": "{commit}", "siblings": [{}]}}"#,
+            siblings.join(", ")
+        )
+        .as_bytes(),
+    );
+    for (path, content) in files {
+        upstream.route(
+            &format!("/example-org/example-model/resolve/{commit}/{path}"),
+            content,
+        );
+    }
+    run(
+        upstream,
+        &dir.join("mirror"),
+        &[],
+        &["pull", "hf:example-org/example-model"],
+    )
+    .result
+    .unwrap();
+}
+
+#[test]
+fn update_moves_a_branch_to_what_the_mirror_has_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let model = "hf:huggingface.co:example-org/example-model (main)";
+    let add = [
+        "add",
+        "hf:example-org/example-model",
+        "--dest",
+        "models/x/",
+        "--path",
+        "config.json",
+    ];
+    run_in(&upstream, &workspace, &[], &add).result.unwrap();
+    run_in(&upstream, &workspace, &[], &["sync"])
+        .result
+        .unwrap();
+
+    let same = run_in(&upstream, &workspace, &[], &["update"]);
+    same.result.unwrap();
+    assert_eq!(same.out, format!("{model}: still {COMMIT}\n"));
+
+    let next = "1111111111111111111111111111111111111111";
+    move_main(
+        &upstream,
+        dir.path(),
+        next,
+        &[("config.json", b"{\"v\": 2}")],
+    );
+    let moved = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["update", "hf:example-org/example-model"],
+    );
+    moved.result.unwrap();
+    assert_eq!(
+        moved.out,
+        format!("{model}: {COMMIT} -> {next}\nmvault sync places what changed\n")
+    );
+    let lock = fs::read_to_string(workspace.join("mvault.lock")).unwrap();
+    assert!(lock.contains(next) && !lock.contains(COMMIT), "{lock}");
+    // Nothing is placed before the next sync.
+    assert_eq!(
+        fs::read(workspace.join("models/x/config.json")).unwrap(),
+        b"{}"
+    );
+    run_in(&upstream, &workspace, &[], &["sync"])
+        .result
+        .unwrap();
+    assert_eq!(
+        fs::read(workspace.join("models/x/config.json")).unwrap(),
+        b"{\"v\": 2}"
+    );
+
+    // A commit without the file the manifest names leaves the lock alone.
+    let empty = "2222222222222222222222222222222222222222";
+    move_main(&upstream, dir.path(), empty, &[("README.md", b"readme")]);
+    let refused = run_in(&upstream, &workspace, &[], &["update"]);
+    let error = refused.result.unwrap_err().to_string();
+    assert!(error.contains("no file \"config.json\""), "{error}");
+    assert_eq!(
+        fs::read_to_string(workspace.join("mvault.lock")).unwrap(),
+        lock
+    );
+
+    let unknown = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["update", "hf:example-org/other"],
+    );
+    let error = unknown.result.unwrap_err().to_string();
+    assert!(
+        error.contains("the manifest has no model hf:huggingface.co:example-org/other"),
+        "{error}"
+    );
+}
+
+#[test]
+fn update_leaves_a_pinned_model_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let add = [
+        "add",
+        "hf:example-org/example-model",
+        "--revision",
+        COMMIT,
+        "--dest",
+        "models/x/",
+        "--path",
+        "config.json",
+    ];
+    run_in(&upstream, &workspace, &[], &add).result.unwrap();
+    let requests = upstream.requests().len();
+
+    let pinned = run_in(&upstream, &workspace, &[], &["update"]);
+    pinned.result.unwrap();
+    assert_eq!(
+        pinned.out,
+        format!("hf:huggingface.co:example-org/example-model ({COMMIT}): pinned by the manifest\n")
+    );
+    assert_eq!(upstream.requests().len(), requests);
+}

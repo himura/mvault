@@ -468,11 +468,16 @@ manifest を使うコマンドは、カレントディレクトリから親へ `
   - `mvault.lock` と配置の記録の読み書きは、このロックの中で行う
 - blob を共有する別の workspace の `sync` は同時に走ってよい。同じ blob の取得は `tmp/` の flock で 1 つに絞る
 
-`update` / `ls` / `status` は未実装。
+`ls` / `status` は未実装。
 
 **`mvault update [source]...`**
 
 - revision (HF のブランチ名、version を省いた civitai) を解決し直して lock を更新する。配置は次の `sync` で行う
+  - source を省くと manifest のすべてのモデル。version を省いた civitai の source は、そのモデルのすべての version のエントリに当たる。manifest に無い source はエラー
+  - `add` と同じく、ミラーの snapshot (と名前) を先に見て、無ければ上流に問い合わせる
+  - manifest が commit や version を書いているモデルは解決し直さない
+  - 解決結果が変わらなければ lock のエントリはそのまま (`sync` が埋めた sha256 を残す)
+  - 書く前に確かめる: 新しい解決結果に、manifest が選んだファイルがあること。駄目なら lock を変えない
 
 **`mvault ls [--untracked] [path]`**
 

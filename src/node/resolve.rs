@@ -178,7 +178,7 @@ pub(crate) fn parse_source(source: &str) -> Result<Source> {
         .map_err(|e| Error::Invalid(e.to_string()))
 }
 
-fn is_commit(revision: &str) -> bool {
+pub(crate) fn is_commit(revision: &str) -> bool {
     revision.len() == 40
         && revision
             .bytes()

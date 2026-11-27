@@ -112,6 +112,43 @@ pub fn plan(manifest: &Manifest, lock: &Lock) -> Result<Vec<Placement>> {
     Ok(placements.into_values().collect())
 }
 
+/// The files the resolved models of the manifest place, ordered by
+/// destination, and the models the lock has no resolution for yet. For
+/// commands that look at a workspace without resolving anything.
+///
+/// # Errors
+///
+/// As [`plan`], for the resolved models.
+pub fn plan_resolved<'a>(
+    manifest: &'a Manifest,
+    lock: &Lock,
+) -> Result<(Vec<Placement>, Vec<&'a Model>)> {
+    let missing = unresolved(manifest, lock);
+    let resolved = Manifest {
+        models: manifest
+            .models
+            .iter()
+            .filter(|model| {
+                let (source, revision) = model.key();
+                lock.get(&source, revision).is_some()
+            })
+            .cloned()
+            .collect(),
+        files: manifest.files.clone(),
+    };
+    Ok((plan(&resolved, lock)?, missing))
+}
+
+/// A model as people know it: the source, and the revision of a
+/// repository in parentheses.
+#[must_use]
+pub fn describe_model(source: &str, revision: Option<&str>) -> String {
+    match revision {
+        Some(revision) => format!("{source} ({revision})"),
+        None => source.to_owned(),
+    }
+}
+
 fn same_file(a: &Placement, b: &Placement) -> bool {
     (&a.source, &a.revision, &a.path, a.file_id) == (&b.source, &b.revision, &b.path, b.file_id)
 }
