@@ -48,8 +48,8 @@ impl<'a> Tokens<'a> {
     /// The token for `host`, written in its one spelling (lower case,
     /// without port 443). It is the first line of the file
     /// `$XDG_CONFIG_HOME/mvault/tokens/<host>` (by default
-    /// `~/.config/mvault/tokens/<host>`), with `_` in place of the `:`
-    /// before a port.
+    /// `~/.config/mvault/tokens/<host>`, where `~` is `HOME`, else
+    /// `USERPROFILE`), with `_` in place of the `:` before a port.
     ///
     /// Without a file of its own, the default hub falls back to the hub's
     /// own settings: `HF_TOKEN`, else the file named by `HF_TOKEN_PATH`,
@@ -78,11 +78,25 @@ impl<'a> Tokens<'a> {
     }
 }
 
-fn tokens_dir(env: Env<'_>) -> Option<PathBuf> {
+/// The directory of mvault's own settings: `$XDG_CONFIG_HOME/mvault`, by
+/// default `~/.config/mvault` (see [`home_dir`] for `~`).
+pub(crate) fn config_dir(env: Env<'_>) -> Option<PathBuf> {
     let config = non_empty(env("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(non_empty(env("HOME"))?).join(".config")))?;
-    Some(config.join("mvault").join("tokens"))
+        .or_else(|| Some(home_dir(env)?.join(".config")))?;
+    Some(config.join("mvault"))
+}
+
+/// The home directory: `HOME`, else `USERPROFILE`, which Windows sets
+/// where it does not set `HOME`.
+fn home_dir(env: Env<'_>) -> Option<PathBuf> {
+    non_empty(env("HOME"))
+        .or_else(|| non_empty(env("USERPROFILE")))
+        .map(PathBuf::from)
+}
+
+fn tokens_dir(env: Env<'_>) -> Option<PathBuf> {
+    Some(config_dir(env)?.join("tokens"))
 }
 
 /// The name of the token file of `host`: `_` in place of the `:` before a
@@ -103,7 +117,7 @@ fn hf_token(env: Env<'_>) -> Result<Option<String>> {
             let home = non_empty(env("HF_HOME")).map(PathBuf::from).or_else(|| {
                 let cache = non_empty(env("XDG_CACHE_HOME"))
                     .map(PathBuf::from)
-                    .or_else(|| Some(PathBuf::from(non_empty(env("HOME"))?).join(".cache")))?;
+                    .or_else(|| Some(home_dir(env)?.join(".cache")))?;
                 Some(cache.join("huggingface"))
             })?;
             Some(home.join("token"))
@@ -199,6 +213,28 @@ mod tests {
         ]);
         let tokens = Tokens::new(&env);
         assert_eq!(tokens.get("example.com").unwrap().as_deref(), Some("xdg"));
+    }
+
+    #[test]
+    fn without_home_the_user_profile_is_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        write(&profile.join(".config/mvault/tokens/example.com"), "site");
+        write(&profile.join(".cache/huggingface/token"), "hub-cli");
+        let env = env_of(&[("USERPROFILE", &profile)]);
+        let tokens = Tokens::new(&env);
+        assert_eq!(tokens.get("example.com").unwrap().as_deref(), Some("site"));
+        assert_eq!(
+            tokens.get(DEFAULT_HF_HOST).unwrap().as_deref(),
+            Some("hub-cli")
+        );
+
+        // HOME, when set, comes first.
+        let env = env_of(&[
+            ("USERPROFILE", &profile),
+            ("HOME", &dir.path().join("home")),
+        ]);
+        assert_eq!(Tokens::new(&env).get("example.com").unwrap(), None);
     }
 
     #[test]

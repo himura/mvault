@@ -216,7 +216,7 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
 ### 4.6 認証
 
 - トークンはコマンドライン引数で受け取らない (`ps` やシェル履歴に残る)
-- トークンはホストごとのファイル `$XDG_CONFIG_HOME/mvault/tokens/<host>` (既定 `~/.config/mvault/tokens/<host>`) に置く。中身は 1 行目だけを使う
+- トークンはホストごとのファイル `$XDG_CONFIG_HOME/mvault/tokens/<host>` (既定 `~/.config/mvault/tokens/<host>`) に置く。`~` は `HOME`、無ければ `USERPROFILE` (Windows は `HOME` を設定しない)。中身は 1 行目だけを使う
   - そのファイルの名前のホストにだけ送る。HuggingFace 系か civitai 系かは問わない
   - URL の形だけで civitai 系と判定するので、ユーザがファイルを置いたホスト以外にはトークンを送らない
   - ファイル名はホストの正規形 (3 章) で書く。ただしポートの前の `:` は `_` にする (`example.com`、`127.0.0.1:8080` なら `127.0.0.1_8080`)。Windows はファイル名に `:` を使えず、書くと別ファイルの代替データストリームになるため。ホスト名に `_` は現れないので取り違えない
@@ -285,7 +285,7 @@ mlenv/                              # workspace
 
 ### 5.2 設定
 
-`~/.config/mvault/config.toml` を基本にし、`<workspace>/.mvault/config.toml` があれば上書きする。
+`$XDG_CONFIG_HOME/mvault/config.toml` (既定 `~/.config/mvault/config.toml`。`~` は `HOME`、無ければ `USERPROFILE`) を基本にし、`<workspace>/.mvault/config.toml` があれば上書きする。
 
 ```toml
 mirrors = ["file:///mnt/vault/public", "https://mvault.example.internal/"]   # 先頭から順に試す

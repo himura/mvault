@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::manifest::STATE_DIR;
-use crate::auth::Env;
+use crate::auth::{Env, config_dir};
 use crate::error::{Error, Result};
 use crate::fsutil::io_error;
 use crate::source::normalize_host;
@@ -104,16 +104,11 @@ impl Config {
 }
 
 /// The path of the settings of the node: `$XDG_CONFIG_HOME/mvault/config.toml`,
-/// by default `~/.config/mvault/config.toml`.
+/// by default `~/.config/mvault/config.toml`, where `~` is `HOME`, else
+/// `USERPROFILE`.
 #[must_use]
 pub fn global_path(env: Env<'_>) -> Option<PathBuf> {
-    let set = |name: &str| {
-        env(name)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    let config = set("XDG_CONFIG_HOME").or_else(|| Some(set("HOME")?.join(".config")))?;
-    Some(config.join("mvault").join("config.toml"))
+    Some(config_dir(env)?.join("config.toml"))
 }
 
 fn read(path: &Path) -> Result<RawConfig> {
@@ -251,6 +246,10 @@ mod tests {
         assert_eq!(
             global_path(&env(&[("HOME", "/home/user")])),
             Some(PathBuf::from("/home/user/.config/mvault/config.toml"))
+        );
+        assert_eq!(
+            global_path(&env(&[("USERPROFILE", "/profile")])),
+            Some(PathBuf::from("/profile/.config/mvault/config.toml"))
         );
         assert_eq!(
             global_path(&env(&[("HOME", "/home/user"), ("XDG_CONFIG_HOME", "/xdg")])),
