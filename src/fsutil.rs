@@ -1,7 +1,7 @@
 //! Small helpers for files written next to the blobs.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -44,16 +44,40 @@ pub(crate) fn is_at(file: &fs::File, path: &Path) -> bool {
 ///
 /// Readers see either the old or the new content, never a part of it: the
 /// content is written to a temporary file in the same directory and renamed.
+///
+/// The content is flushed to disk before the rename, and the rename after
+/// it, so that a power loss leaves the old content or the new, and not an
+/// empty file that no command could read any more.
 pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).map_err(io_error(dir))?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
-    fs::write(&tmp, content).map_err(io_error(&tmp))?;
-    fs::rename(&tmp, path).map_err(|e| {
+    let written = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(content)?;
+            file.sync_all()
+        })
+        .map_err(io_error(&tmp));
+    let renamed = written.and_then(|()| fs::rename(&tmp, path).map_err(io_error(path)));
+    if renamed.is_err() {
         let _ = fs::remove_file(&tmp);
-        io_error(path)(e)
-    })
+    }
+    renamed?;
+    sync_dir(dir).map_err(io_error(dir))
+}
+
+/// Makes the creation, removal or rename of an entry of `dir` durable.
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Elsewhere a directory cannot be opened to be flushed.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Checks that a path from outside (an API response, a command line) names a

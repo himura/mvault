@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::fsutil::sync_dir;
 use crate::hash::Sha256;
 
 /// A directory of blobs and the directory where they are written before they
@@ -336,18 +337,6 @@ fn create_dir_all_synced(dir: &Path) -> io::Result<()> {
     if let Some(parent) = parent {
         sync_dir(parent).map_err(|e| with_path(&e, parent))?;
     }
-    Ok(())
-}
-
-/// Makes the rename into `dir` durable.
-#[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
