@@ -16,6 +16,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use log::debug;
+
 use super::gc::gc_lock;
 use super::lock::Lock;
 use super::manifest::Manifest;
@@ -127,6 +129,20 @@ pub(crate) enum Action {
     Damaged,
 }
 
+impl Action {
+    /// What the action does, for the log.
+    fn describe(self, options: Options) -> &'static str {
+        match self {
+            Self::Keep => "in place",
+            Self::Place => "nothing there; to link",
+            Self::Replace if options.force => "to link over what is there (--force)",
+            Self::Replace => "a managed file with other content is there; to link over it",
+            Self::Conflict => "taken by a file mvault does not manage; left alone",
+            Self::Damaged => "its blob was written to; left alone",
+        }
+    }
+}
+
 /// What to do with a recorded file the manifest no longer places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fate {
@@ -138,6 +154,18 @@ pub(crate) enum Fate {
     Damaged,
     /// It is gone or no longer a link to its blob: forget it.
     Forget,
+}
+
+impl Fate {
+    /// What becomes of the file, for the log.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Remove => "to remove (--prune)",
+            Self::Leave => "left in place without --prune",
+            Self::Damaged => "its blob was written to",
+            Self::Forget => "gone or not a link to a blob, so forgotten",
+        }
+    }
 }
 
 /// What a sync is going to do.
@@ -210,6 +238,7 @@ pub fn sync(
     // linked to it keep the content they were given.
     if options.force {
         for digest in &survey.damaged {
+            debug!("blob {digest} was written to; --force takes it out of the store");
             workspace.store.remove(digest).map_err(Error::Store)?;
         }
     }
@@ -217,6 +246,10 @@ pub fn sync(
     for (position, index) in survey.fetch.iter().enumerate() {
         if is_stored(workspace, &placements[*index]) {
             // The same file, placed twice, was fetched for the other place.
+            debug!(
+                "{}: its blob was fetched for another destination",
+                placements[*index].dest
+            );
             continue;
         }
         on_event(Event::Fetching {
@@ -429,6 +462,7 @@ pub(crate) fn survey(
         let damaged = matches!(blob, Some((_, BlobState::Damaged)));
         let stored = matches!(blob, Some((_, BlobState::Stored)));
         if damaged && !options.force {
+            debug!("{}: {}", placement.dest, Action::Damaged.describe(options));
             survey.actions.push(Action::Damaged);
             continue;
         }
@@ -442,6 +476,7 @@ pub(crate) fn survey(
             }
         };
         if needs_fetch {
+            debug!("{}: its blob is not stored; to fetch", placement.dest);
             survey.fetch.push(index);
         }
 
@@ -475,6 +510,7 @@ pub(crate) fn survey(
                 }
             }
         };
+        debug!("{}: {}", placement.dest, action.describe(options));
         survey.actions.push(action);
     }
 
@@ -491,6 +527,10 @@ pub(crate) fn survey(
             None => Fate::Forget,
             Some(digest) => {
                 if digest != entry.sha256 {
+                    debug!(
+                        "{dest}: recorded with blob {}, but linked to blob {digest}",
+                        entry.sha256
+                    );
                     survey.corrected.push((dest.to_owned(), digest));
                 }
                 if blobs.state(digest)? == BlobState::Damaged {
@@ -502,6 +542,7 @@ pub(crate) fn survey(
                 }
             }
         };
+        debug!("{dest}: no longer placed; {}", fate.describe());
         survey.dropped.push((dest.to_owned(), fate));
     }
     survey.damaged = blobs.damaged();
@@ -555,10 +596,15 @@ impl<'a> Blobs<'a> {
             None => BlobState::Missing,
             Some(stamp) => match self.recorded.get(&digest) {
                 Some(recorded) if *recorded != stamp => {
+                    debug!(
+                        "blob {digest} changed its size or time since it was recorded; hashing it"
+                    );
                     if hash_file(&path)? == digest {
+                        debug!("blob {digest} still has its digest");
                         self.restamped.insert(digest, stamp);
                         BlobState::Stored
                     } else {
+                        debug!("blob {digest} no longer has its digest");
                         BlobState::Damaged
                     }
                 }
@@ -596,6 +642,7 @@ fn bring_up_to_date(
                 model.source
             )));
         }
+        debug!("{}: not in the lock file; resolving it", model.source);
         let locked = resolve(model, access)?;
         on_event(Event::Resolved {
             source: &locked.source,
@@ -616,6 +663,7 @@ fn bring_up_to_date(
         if let Some(locked) = lock.get_mut(source, revision.as_deref())
             && fill_digests(locked, access)?
         {
+            debug!("{source}: digests the upstream did not announce are known now");
             changed = true;
         }
     }
@@ -677,9 +725,11 @@ fn fetch(
 
     if let Some(digest) = placement.sha256 {
         if store.contains(&digest) {
+            debug!("blob {digest} was stored by another process meanwhile");
             return Ok(digest);
         }
         for remote in access.usable_remotes() {
+            debug!("asking mirror {} for blob {digest}", remote.redacted());
             let fetched = remote.fetch_blob(
                 access.http,
                 &digest,
@@ -689,6 +739,7 @@ fn fetch(
             );
             match fetched {
                 Ok(Some(downloaded)) if downloaded.sha256 == digest => {
+                    debug!("storing blob {digest} from mirror {}", remote.redacted());
                     store.commit(&partial, &digest).map_err(Error::Store)?;
                     return Ok(digest);
                 }
@@ -699,7 +750,7 @@ fn fetch(
                         downloaded.sha256
                     )));
                 }
-                Ok(None) => {}
+                Ok(None) => debug!("mirror {} does not have blob {digest}", remote.redacted()),
                 Err(error) => access.mirror_failed(remote, &error),
             }
         }
@@ -707,6 +758,7 @@ fn fetch(
 
     let source = parse_source(&placement.source)?;
     if !workspace.config.allow_official {
+        debug!("fetching from the upstream is not allowed by the settings (allow_official)");
         return Err(Error::Invalid(format!(
             "{}: no mirror has {} of {}; on the mirror host run: {}",
             placement.dest,
@@ -718,8 +770,16 @@ fn fetch(
     if placement.sha256.is_none() {
         // Without a digest to compare with, the beginning left by an
         // earlier run cannot be told from that of a replaced file.
+        debug!(
+            "{}: no digest known, so a partial file is not continued",
+            placement.dest
+        );
         remove_if_exists(&partial)?;
     }
+    debug!(
+        "{}: fetching {} of {} from the upstream",
+        placement.dest, placement.path, placement.source
+    );
     let (url, downloaded) = from_upstream(access, &source, placement, &partial, on_event)?;
     let mismatch = match (placement.sha256, placement.size) {
         (Some(digest), _) if digest != downloaded.sha256 => Some(format!(
@@ -732,9 +792,15 @@ fn fetch(
         _ => None,
     };
     if let Some(reason) = mismatch {
+        debug!(
+            "{}: {reason}; removing {}",
+            placement.dest,
+            partial.display()
+        );
         remove_if_exists(&partial)?;
         return Err(Error::Upstream { url, reason });
     }
+    debug!("storing blob {} from the upstream", downloaded.sha256);
     store
         .commit(&partial, &downloaded.sha256)
         .map_err(Error::Store)?;

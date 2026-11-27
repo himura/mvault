@@ -129,6 +129,17 @@ impl Remote {
     }
 }
 
+impl Remote {
+    /// The location as the log shows it: a URL without user, password and
+    /// query.
+    pub(crate) fn redacted(&self) -> String {
+        match self {
+            Self::Dir(dir) => dir.display().to_string(),
+            Self::Http(base) => crate::download::redact(base),
+        }
+    }
+}
+
 impl std::fmt::Display for Remote {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
