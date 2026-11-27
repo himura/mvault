@@ -491,6 +491,67 @@ fn a_managed_file_is_replaced_when_the_manifest_changes() {
     assert_eq!(world.lock_text(), lock);
 }
 
+/// Places `config.json` at `models/current.bin` and the weights elsewhere,
+/// then writes down `models/current.bin` as the weights: what a sync that
+/// stopped between writing down a replacement and linking it leaves.
+fn stop_before_replacing(world: &World) {
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [\n  {{ path = \"config.json\", dest = \"models/current.bin\" }},\n  {{ path = \"vae/model.safetensors\", dest = \"models/weights.bin\" }},\n]\n"
+    ));
+    world.sync(Options::default()).unwrap();
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let weights = Sha256::of(b"weights");
+    let stamp = Stamp::of(&workspace.store.blob_path(&weights))
+        .unwrap()
+        .unwrap();
+    let mut record = Placed::load(&workspace.placed_path()).unwrap();
+    record.insert("models/current.bin".to_owned(), stamp.entry(weights));
+    record.save(&workspace.placed_path()).unwrap();
+}
+
+#[test]
+fn a_replacement_that_was_written_down_but_not_linked_is_done_next_time() {
+    let world = World::new();
+    stop_before_replacing(&world);
+
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"vae/model.safetensors\", dest = \"models/current.bin\" }}]\n"
+    ));
+    let report = world.sync(Options::default()).unwrap();
+
+    assert_eq!(report.conflicts, Vec::<String>::new());
+    assert_eq!(report.linked, 1);
+    assert!(is_link_to_blob(&world, "models/current.bin", b"weights"));
+}
+
+#[test]
+fn a_file_dropped_while_its_replacement_was_not_linked_is_still_pruned() {
+    let world = World::new();
+    stop_before_replacing(&world);
+    world.manifest(&format!(
+        "[[model]]\nsource = \"hf:{HUB}:{REPO}\"\nfiles = [{{ path = \"vae/model.safetensors\", dest = \"models/weights.bin\" }}]\n"
+    ));
+
+    let without = world.sync(Options::default()).unwrap();
+    assert_eq!(without.dropped, ["models/current.bin"]);
+    // The record now names the blob the file is a link to.
+    let workspace = Workspace::open(world.root(), None).unwrap();
+    let record = Placed::load(&workspace.placed_path()).unwrap();
+    assert_eq!(
+        record.get("models/current.bin").map(|entry| entry.sha256),
+        Some(Sha256::of(b"{}"))
+    );
+
+    let report = world
+        .sync(Options {
+            prune: true,
+            ..Options::default()
+        })
+        .unwrap();
+    assert_eq!(report.pruned, 1);
+    assert!(!world.exists("models/current.bin"));
+}
+
 #[test]
 fn prune_removes_recorded_files_only() {
     let world = World::new();

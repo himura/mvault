@@ -26,6 +26,7 @@ use super::workspace::Workspace;
 use crate::download::{Downloaded, Progress, Request};
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, lock_file};
+use crate::gc::blob_at;
 use crate::hash::Sha256;
 use crate::source::Source;
 use crate::store::BlobStore;
@@ -154,6 +155,9 @@ pub(crate) struct Survey {
     /// Blobs that were touched but still have their digest, with their
     /// stamp now.
     pub(crate) restamped: BTreeMap<Sha256, Stamp>,
+    /// Recorded files the manifest no longer places that are links to
+    /// another blob than the recorded one, with that blob.
+    pub(crate) corrected: Vec<(String, Sha256)>,
 }
 
 /// Makes `workspace` match its manifest.
@@ -284,6 +288,12 @@ fn record_placements(
     // Written down before the links are made: a file linked but not
     // recorded could never be pruned, while an entry for a link that was
     // not made is forgotten by the next sync.
+    for (dest, digest) in &survey.corrected {
+        let blob = workspace.store.blob_path(digest);
+        if let Some(stamp) = Stamp::of(&blob)? {
+            record.insert(dest.clone(), stamp.entry(*digest));
+        }
+    }
     for (digest, stamp) in &survey.restamped {
         let dests: Vec<String> = record
             .iter()
@@ -452,11 +462,11 @@ pub(crate) fn survey(
                     }
                 }
                 At::File => {
+                    // Not necessarily the recorded blob: a sync that stopped
+                    // between writing down a replacement and linking it
+                    // leaves the blob before.
                     let recorded = record.get(&placement.dest).map(|entry| entry.sha256);
-                    let is_managed = match recorded {
-                        Some(digest) => is_same(&dest, &store.blob_path(&digest))?,
-                        None => managed.contains(&dest)?,
-                    };
+                    let is_managed = managed.blob_of(&dest, recorded)?.is_some();
                     if is_managed || options.force {
                         Action::Replace
                     } else {
@@ -477,15 +487,20 @@ pub(crate) fn survey(
             continue;
         }
         let path = workspace.root.join(dest);
-        let blob = store.blob_path(&entry.sha256);
-        let fate = if !is_same(&path, &blob)? {
-            Fate::Forget
-        } else if blobs.state(entry.sha256)? == BlobState::Damaged {
-            Fate::Damaged
-        } else if options.prune {
-            Fate::Remove
-        } else {
-            Fate::Leave
+        let fate = match managed.blob_of(&path, Some(entry.sha256))? {
+            None => Fate::Forget,
+            Some(digest) => {
+                if digest != entry.sha256 {
+                    survey.corrected.push((dest.to_owned(), digest));
+                }
+                if blobs.state(digest)? == BlobState::Damaged {
+                    Fate::Damaged
+                } else if options.prune {
+                    Fate::Remove
+                } else {
+                    Fate::Leave
+                }
+            }
         };
         survey.dropped.push((dest.to_owned(), fate));
     }
@@ -846,7 +861,9 @@ impl<'a> Managed<'a> {
         }
     }
 
-    fn contains(&mut self, path: &Path) -> Result<bool> {
+    /// The digest of the blob that the regular file at `path` is a hard
+    /// link to, if any.
+    fn find(&mut self, path: &Path) -> Result<Option<Sha256>> {
         let by_size = match &mut self.by_size {
             Some(by_size) => by_size,
             none => {
@@ -863,7 +880,23 @@ impl<'a> Managed<'a> {
         let candidates = by_size.get(&size).map_or(&[][..], Vec::as_slice);
         Ok(candidates
             .iter()
-            .any(|blob| same_file::is_same_file(path, blob).unwrap_or(false)))
+            .find(|blob| same_file::is_same_file(path, blob).unwrap_or(false))
+            .and_then(|blob| blob_at(self.store, blob)))
+    }
+
+    /// The digest of the blob that the file at `path` is a hard link to:
+    /// `recorded` if it is that one, any other otherwise. `None` if it is
+    /// missing or not a hard link to a blob.
+    fn blob_of(&mut self, path: &Path, recorded: Option<Sha256>) -> Result<Option<Sha256>> {
+        if let Some(digest) = recorded
+            && is_same(path, &self.store.blob_path(&digest))?
+        {
+            return Ok(Some(digest));
+        }
+        match what_is_at(path)? {
+            At::File => self.find(path),
+            At::Nothing | At::Other => Ok(None),
+        }
     }
 }
 
