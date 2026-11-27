@@ -129,6 +129,19 @@ pub struct Collected {
     pub untracked: Vec<PathBuf>,
 }
 
+/// A snapshot of the mirror, as `mirror ls` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// The source, in canonical form without a version.
+    pub source: String,
+    /// The commit or version.
+    pub revision: String,
+    /// The names that stand for this revision, ordered.
+    pub refs: Vec<String>,
+    /// The files, ordered by path and file id.
+    pub files: Vec<FileEntry>,
+}
+
 /// What to pull from a hub.
 #[derive(Debug, Clone, Copy)]
 pub struct HfPull<'a> {
@@ -690,6 +703,42 @@ impl Mirror {
             missing,
             untracked,
         })
+    }
+
+    /// The snapshots of the mirror, ordered by source and revision: all of
+    /// them, those of `source` (in canonical form without a version), or
+    /// with `revision` too, the one it is or a name stands for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be read.
+    pub fn list(&self, source: Option<&str>, revision: Option<&str>) -> Result<Vec<Listing>> {
+        let mut listings = Vec::new();
+        for (id, snapshot_source, snapshot_revision) in self.db.snapshots()? {
+            if source.is_some_and(|source| source != snapshot_source) {
+                continue;
+            }
+            let refs: Vec<String> = self
+                .db
+                .refs(&snapshot_source)?
+                .into_iter()
+                .filter(|(_, target)| *target == snapshot_revision)
+                .map(|(name, _)| name)
+                .collect();
+            let wanted = revision.is_none_or(|revision| {
+                revision == snapshot_revision || refs.iter().any(|name| name == revision)
+            });
+            if !wanted {
+                continue;
+            }
+            listings.push(Listing {
+                files: self.db.snapshot_files(id)?,
+                source: snapshot_source,
+                revision: snapshot_revision,
+                refs,
+            });
+        }
+        Ok(listings)
     }
 
     /// Writes the files of every snapshot for nodes again, from the

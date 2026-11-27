@@ -33,7 +33,7 @@ ML / AI モデルの保管庫 (ミラー) と、計算ノードへの配布ツ�
 
 | 系統 | コマンド | 実行場所 | 必要なもの |
 |---|---|---|---|
-| ミラー | `mvault mirror init / pull / ls / rm / gc / export` | ミラーホスト | ミラーの root、上流のトークン |
+| ミラー | `mvault mirror init / pull / ls / gc / export` | ミラーホスト | ミラーの root、上流のトークン |
 | ノード | `mvault init / add / sync / update / ls / status / gc` | workspace | ミラーの URL |
 
 どのコマンドも `--log <debug|trace>` (環境変数 `MVAULT_LOG`) で、何をなぜしたかのログを stderr に書く。`off` (既定) で書かない。
@@ -198,12 +198,11 @@ mvault mirror pull civitai 12345@67890 [--host example.com] [--file-id <id>]... 
 
 ### 4.5 その他のミラーコマンド
 
-`gc` 以外は未実装。
-
 - `mvault mirror init`: `public/`、`private/`、DB を作る
   - 他のミラーコマンドは作らない。DB が無ければエラーにする (root を打ち間違えたときに、空のミラーを作って成功しないように)
-- `mvault mirror ls [source]`: ミラーにある snapshot と、そのファイル・サイズ・取得状況を表示する
-- `mvault mirror rm <source>[@<revision>]`: snapshot を消す (blob は GC が消す)。頻度は低い想定
+- `mvault mirror ls [source[@<revision>]]`: ミラーにある snapshot を 1 行ずつ、取得済みのファイル数と合計サイズ、その snapshot を指す名前 (`main`、`latest` など) とともに表示する
+  - source を付けると、その snapshot のファイル・サイズ・取得状況も表示する
+  - `<revision>` は commit / versionId か、それを指す名前。HuggingFace の正規形では `hf:<org>/<repo>@<revision>`、civitai では `@<versionId>`、URL では URL の revision
 - `mvault mirror gc [-n] [--min-age <期間>]`: どの snapshot からも参照されない blob を消す
   - 作成から `--min-age` (既定 1 日) 経っていないものは消さない
   - blob の削除は 4.2 と同じ書き込みトランザクションの中で、blob 1 つごとに行う。実行中の pull は 1 つ分待たされるだけで、消された blob を使い始めることはない
@@ -544,3 +543,7 @@ manifest を使うコマンドは、カレントディレクトリから親へ `
 - civitai のプレビュー画像の保存 (`mirror pull --with-images`)
 - ノードからミラーへのアップロード (ノードが上流から直接取得したものをミラーに入れる)
 - ミラーとノードが同じマシンにあるときのコピー省略 (reflink / hardlink)
+- `mvault mirror rm [-n] <source>[@<revision>]`: snapshot と、それを指す名前 (`refs/<revision>`、`latest`)、`metadata/` のその revision の応答を消す。blob は `mirror gc` が消す。頻度は低い想定
+  - 一度実装したが外した。DB を何も変えないまま `public/` のファイルを消し始めるので、同じ source の `pull` が走っていると、その最後の書き出しが、DB に無い (ファイルが空の) snapshot と名前を `public/` に書き戻す
+  - 先に DB で snapshot を「消している途中」にし、`pull` はそれに書き込まず、書き出しもしないようにする (snapshot の状態を表す列など、スキーマの見直し)。その snapshot の blob は、行が消えるまで GC から使用中とみなす
+  - 状態を調べてから `public/` に書くまでの間に `rm` が割り込むと同じことが起きるので、書き出しと状態の変更は同じロック (DB の書き込みトランザクションか、source ごとのロック) の中で行う

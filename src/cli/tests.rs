@@ -1114,3 +1114,64 @@ fn init_writes_a_relative_mirror_as_an_absolute_path() {
     );
     assert_eq!(settings, format!("mirrors = [{expected}]\n"));
 }
+
+#[test]
+fn mirror_ls_lists_snapshots_and_with_a_source_their_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let hf = [
+        "pull",
+        "hf:example-org/example-model",
+        "--exclude",
+        "assets",
+    ];
+    run(&upstream, dir.path(), &[], &hf).result.unwrap();
+    configure(dir.path(), "[civitai]\ndefault_host = \"example.com\"\n");
+    run(&upstream, dir.path(), &[], &["pull", "civitai:12345"])
+        .result
+        .unwrap();
+
+    let all = run(&upstream, dir.path(), &[], &["ls"]);
+    all.result.unwrap();
+    assert_eq!(
+        all.out,
+        format!(
+            "civitai:example.com:12345@67890 (latest)  1 of 2 file(s) fetched, 7 B\n\
+             hf:huggingface.co:example-org/example-model@{COMMIT} (main)  1 of 2 file(s) fetched, 2 B\n"
+        )
+    );
+
+    for given in [
+        "hf:example-org/example-model".to_owned(),
+        "hf:example-org/example-model@main".to_owned(),
+        format!("hf:example-org/example-model@{COMMIT}"),
+        "https://huggingface.co/example-org/example-model/tree/main".to_owned(),
+    ] {
+        let one = run(&upstream, dir.path(), &[], &["ls", &given]);
+        one.result.unwrap();
+        assert_eq!(
+            one.out,
+            format!(
+                "hf:huggingface.co:example-org/example-model@{COMMIT} (main)  1 of 2 file(s) fetched, 2 B\n  \
+                 assets/sample.mp4  6 B  not fetched\n  \
+                 config.json        2 B  fetched\n"
+            ),
+            "{given}"
+        );
+    }
+    let version = run(&upstream, dir.path(), &[], &["ls", "civitai:12345@67890"]);
+    version.result.unwrap();
+    assert_eq!(
+        version.out,
+        "civitai:example.com:12345@67890 (latest)  1 of 2 file(s) fetched, 7 B\n  \
+         222: extra.zip          -    not fetched\n  \
+         111: model.safetensors  7 B  fetched, primary\n"
+    );
+
+    let none = run(&upstream, dir.path(), &[], &["ls", "hf:example-org/other"]);
+    let error = none.result.unwrap_err().to_string();
+    assert!(
+        error.contains("no snapshot of hf:huggingface.co:example-org/other"),
+        "{error}"
+    );
+}

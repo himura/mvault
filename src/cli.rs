@@ -68,10 +68,19 @@ enum MirrorCommand {
     Init,
     /// Fetch a repository or a model version from its upstream
     Pull(PullArgs),
+    /// List the snapshots of the mirror; with SOURCE, also their files
+    Ls(MirrorLsArgs),
     /// Write the files nodes read again, from the database of the mirror
     Export,
     /// Remove the blobs no snapshot uses, and unfinished downloads
     Gc(MirrorGcArgs),
+}
+
+#[derive(Debug, Args)]
+struct MirrorLsArgs {
+    /// A page URL or canonical form, with `@<revision>` for one snapshot
+    #[arg(value_name = "SOURCE")]
+    source: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +182,7 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
             match mirror.command {
                 MirrorCommand::Init => mirror_init(&root, context),
                 MirrorCommand::Pull(args) => pull(&root, &args, config_dir, context),
+                MirrorCommand::Ls(args) => mirror_ls(&root, args.source.as_deref(), context),
                 MirrorCommand::Export => {
                     let count = Mirror::open(&root)?.export_all()?;
                     writeln!(context.out, "wrote {count} snapshot(s)")
@@ -295,6 +305,148 @@ fn mirror_init(root: &std::path::Path, context: &mut Context<'_>) -> Result<()> 
     };
     writeln!(context.out, "{message}")
         .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+/// Reads a snapshot given on the command line: a source in any form
+/// [`Reference::parse`] takes, a `hf:` form followed by `@<revision>`. Returns
+/// the source in canonical form without a version, and the revision if one
+/// was given.
+fn parse_snapshot(text: &str, root: &std::path::Path) -> Result<(String, Option<String>)> {
+    let (text, revision) = match text
+        .strip_prefix("hf:")
+        .and_then(|rest| rest.rsplit_once('@'))
+    {
+        Some((repo, revision)) => (format!("hf:{repo}"), Some(revision.to_owned())),
+        None => (text.to_owned(), None),
+    };
+    let defaults = Defaults {
+        civitai_host: Config::load(root)?.civitai.default_host,
+    };
+    let reference =
+        Reference::parse(&text, &defaults).map_err(|e| Error::Invalid(e.to_string()))?;
+    if reference.path.is_some() || reference.file_id.is_some() {
+        return Err(Error::Invalid(
+            "the URL names a file; a snapshot holds a repository or a model version".into(),
+        ));
+    }
+    match reference.source {
+        Source::HuggingFace { .. } => Ok((
+            reference.source.to_string(),
+            revision.or(reference.revision),
+        )),
+        Source::Civitai {
+            host,
+            model_id,
+            version_id,
+        } => Ok((
+            Source::Civitai {
+                host,
+                model_id,
+                version_id: None,
+            }
+            .to_string(),
+            version_id.map(|id| id.to_string()),
+        )),
+    }
+}
+
+fn mirror_ls(
+    root: &std::path::Path,
+    source: Option<&str>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let mirror = Mirror::open(root)?;
+    let (source, revision) = match source {
+        Some(text) => {
+            let (source, revision) = parse_snapshot(text, root)?;
+            (Some(source), revision)
+        }
+        None => (None, None),
+    };
+    let listings = mirror.list(source.as_deref(), revision.as_deref())?;
+    if listings.is_empty() && source.is_some() {
+        return Err(Error::Invalid(format!(
+            "the mirror has no snapshot of {}",
+            source.unwrap_or_default()
+        )));
+    }
+    let mut text = String::new();
+    for listing in &listings {
+        use std::fmt::Write as _;
+        let fetched: Vec<_> = listing.files.iter().filter(|file| file.fetched).collect();
+        let size: u64 = fetched.iter().filter_map(|file| file.size).sum();
+        let names = if listing.refs.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", listing.refs.join(", "))
+        };
+        let _ = writeln!(
+            text,
+            "{}@{}{names}  {} of {} file(s) fetched, {}",
+            listing.source,
+            listing.revision,
+            fetched.len(),
+            listing.files.len(),
+            human_size(size)
+        );
+        if source.is_none() {
+            continue;
+        }
+        let rows: Vec<[String; 3]> = listing
+            .files
+            .iter()
+            .map(|file| {
+                let name = match file.file_id {
+                    Some(id) => format!("{id}: {}", file.path),
+                    None => file.path.clone(),
+                };
+                let mut state = if file.fetched {
+                    "fetched"
+                } else {
+                    "not fetched"
+                }
+                .to_owned();
+                if file.primary {
+                    state.push_str(", primary");
+                }
+                [
+                    name,
+                    file.size.map_or_else(|| "-".to_owned(), human_size),
+                    state,
+                ]
+            })
+            .collect();
+        text.push_str(&table(&rows, "  "));
+    }
+    write!(context.out, "{text}")
+        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+/// Lines of columns, each column as wide as its widest cell, the last one
+/// not padded. Every line starts with `indent`.
+fn table<const N: usize>(rows: &[[String; N]], indent: &str) -> String {
+    let mut widths = [0; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut text = String::new();
+    for row in rows {
+        let mut line = indent.to_owned();
+        for (index, cell) in row.iter().enumerate() {
+            if index + 1 == N {
+                line.push_str(cell);
+            } else {
+                let pad = widths[index] - cell.chars().count();
+                line.push_str(cell);
+                line.push_str(&" ".repeat(pad + 2));
+            }
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text
 }
 
 fn mirror_gc(root: &std::path::Path, args: &MirrorGcArgs, context: &mut Context<'_>) -> Result<()> {
