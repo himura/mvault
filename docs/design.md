@@ -36,6 +36,13 @@ ML / AI モデルの保管庫 (ミラー) と、計算ノードへの配布ツ�
 | ミラー | `mvault mirror init / pull / ls / rm / gc / export` | ミラーホスト | ミラーの root、上流のトークン |
 | ノード | `mvault init / add / sync / update / ls / status / gc` | workspace | ミラーの URL |
 
+どのコマンドも `--log <debug|trace>` (環境変数 `MVAULT_LOG`) で、何をなぜしたかのログを stderr に書く。`off` (既定) で書かない。
+
+- `debug` は判断とその理由 (取得・配置・削除・リトライ・ロック待ち・使った設定とトークンの出どころ)、`trace` はそれに加えて応答ヘッダ
+- 書くのは mvault 自身のログだけ。HTTP クライアントのログは Authorization ヘッダを含みうるので書かない。トークンそのもの、URL の user / password / query (署名付き URL では鍵になる) も書かない
+- ログを書く間は進捗の行を書き換えない (ログの行で崩れるので)
+- `-v` は空けておく (`status -v` のような、出力を詳しくするオプションに使う)
+
 ## 3. 取得元の表記
 
 manifest、lock、ミラーの内部で共通に使う正規形。
