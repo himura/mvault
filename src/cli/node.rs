@@ -259,13 +259,13 @@ fn with_access<T>(
 ) -> Result<T> {
     let remotes = workspace.remotes()?;
     // Each token is for one host only; see `mvault mirror pull`.
-    let tokens = Tokens::load(context.env)?;
+    let tokens = Tokens::new(context.env);
     let base_url = context.base_url;
     let access = Access {
         http: &context.http,
         remotes: &remotes,
-        hub: &|host| Hub::new(&base_url(host), tokens.get(host)),
-        site: &|host| Site::new(&base_url(host), tokens.get(host)),
+        hub: &|host| Ok(Hub::new(&base_url(host), tokens.get(host)?.as_deref())),
+        site: &|host| Ok(Site::new(&base_url(host), tokens.get(host)?.as_deref())),
         warnings: RefCell::default(),
         down: RefCell::default(),
     };

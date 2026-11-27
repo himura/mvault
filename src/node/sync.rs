@@ -734,7 +734,7 @@ fn from_upstream(
     let mut progress = |progress| on_event(Event::Progress(progress));
     match source {
         Source::HuggingFace { host, repo } => {
-            let hub = (access.hub)(host);
+            let hub = (access.hub)(host)?;
             let url = hub.file_url(repo, &placement.resolved, &placement.path);
             let request = Request {
                 url: &url,
@@ -745,7 +745,7 @@ fn from_upstream(
             Ok((url, downloaded))
         }
         Source::Civitai { host, .. } => {
-            let site = (access.site)(host);
+            let site = (access.site)(host)?;
             let version_id = placement.resolved.parse().map_err(|_| {
                 Error::Invalid(format!(
                     "{}: {:?} is not a version id",

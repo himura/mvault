@@ -174,8 +174,8 @@ impl World {
         let access = Access {
             http: &http,
             remotes,
-            hub: &|_| Hub::new(&base, None),
-            site: &|_| Site::new(&base, None),
+            hub: &|_| Ok(Hub::new(&base, None)),
+            site: &|_| Ok(Site::new(&base, None)),
             warnings: RefCell::default(),
             down: RefCell::default(),
         };

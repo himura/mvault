@@ -159,7 +159,7 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
     let mut mirror = Mirror::open(root)?;
     // Any https URL of the right shape is taken for a site of its kind, so
     // a token goes only to the host its file is named by.
-    let tokens = Tokens::load(context.env)?;
+    let tokens = Tokens::new(context.env);
     let mut reporter = Reporter {
         err: &mut *context.err,
         live: context.live,
@@ -189,8 +189,8 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
                 (Some(revision), _) | (None, Some(revision)) => revision.as_str(),
                 (None, None) => "main",
             };
-            let token = tokens.get(host);
-            let hub = Hub::new(&(context.base_url)(host), token);
+            let token = tokens.get(host)?;
+            let hub = Hub::new(&(context.base_url)(host), token.as_deref());
             let pull = HfPull {
                 hub: &hub,
                 host,
@@ -222,8 +222,8 @@ fn pull(root: &std::path::Path, args: &PullArgs, context: &mut Context<'_>) -> R
             } else {
                 Selection::Files(file_ids)
             };
-            let token = tokens.get(host);
-            let site = Site::new(&(context.base_url)(host), token);
+            let token = tokens.get(host)?;
+            let site = Site::new(&(context.base_url)(host), token.as_deref());
             let pull = CivitaiPull {
                 site: &site,
                 host,

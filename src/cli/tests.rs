@@ -356,10 +356,14 @@ fn each_site_gets_the_token_of_its_host() {
 }
 
 #[test]
-fn a_token_file_not_named_by_a_host_is_an_error() {
+fn files_not_named_by_the_host_pulled_from_are_left_alone() {
     let upstream = Upstream::start();
     let config_home = tempfile::tempdir().unwrap();
-    write_tokens(config_home.path(), &[("Example.com", "secret")]);
+    // A backup, and a spelling of the host that is not its one spelling.
+    write_tokens(
+        config_home.path(),
+        &[("example.com~", "backup"), ("example.com_443", "secret")],
+    );
     let dir = tempfile::tempdir().unwrap();
 
     let run = run(
@@ -369,9 +373,8 @@ fn a_token_file_not_named_by_a_host_is_an_error() {
         &["pull", "civitai:example.com:12345@67890"],
     );
 
-    let error = run.result.unwrap_err().to_string();
-    assert!(error.contains("named by the host"), "{error}");
-    assert_eq!(authorizations(&upstream), []);
+    run.result.unwrap();
+    assert!(authorizations(&upstream).iter().all(Option::is_none));
 }
 
 #[test]
