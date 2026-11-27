@@ -3,7 +3,9 @@
 //! Tokens are never taken from the command line, where they would show up
 //! in the process list and the shell history. Each one is kept in a file
 //! named after the one host it is for, `~/.config/mvault/tokens/<host>`:
-//! a token goes to a host only if the user put it there for that host.
+//! a token goes to a host only if the user put it there for that host. A
+//! port is written after `_` rather than `:`, which Windows does not allow
+//! in a file name (`127.0.0.1_8080` for `127.0.0.1:8080`).
 
 use std::collections::HashMap;
 use std::fs;
@@ -30,8 +32,9 @@ impl std::fmt::Debug for Tokens {
 
 impl Tokens {
     /// Reads the token files of `$XDG_CONFIG_HOME/mvault/tokens/` (by
-    /// default `~/.config/mvault/tokens/`), one per host and named by it.
-    /// Names that start with a dot are left alone.
+    /// default `~/.config/mvault/tokens/`), one per host and named by it,
+    /// with `_` in place of the `:` before a port. Names that start with a
+    /// dot are left alone.
     ///
     /// Without a file of its own, the default hub falls back to the hub's
     /// own settings: `HF_TOKEN`, else the file named by `HF_TOKEN_PATH`,
@@ -65,11 +68,11 @@ impl Tokens {
                 if name.starts_with('.') {
                     continue;
                 }
-                if normalize_host(name).ok().as_deref() != Some(name) {
+                let Some(host) = host_of_file_name(name) else {
                     return Err(not_a_host(&path));
-                }
+                };
                 if let Some(token) = read_token(path)? {
-                    tokens.insert(name.to_owned(), token);
+                    tokens.insert(host, token);
                 }
             }
         }
@@ -99,9 +102,21 @@ fn tokens_dir(env: Env<'_>) -> Option<PathBuf> {
     Some(config.join("mvault").join("tokens"))
 }
 
+/// The host a token file is for, if `name` is the host in its one
+/// spelling with `_` in place of the `:` before a port. Host names have no
+/// `_`, so the two cannot be confused.
+fn host_of_file_name(name: &str) -> Option<String> {
+    if name.contains(':') {
+        return None;
+    }
+    let host = name.replacen('_', ":", 1);
+    (normalize_host(&host).ok().as_deref() == Some(host.as_str())).then_some(host)
+}
+
 fn not_a_host(path: &Path) -> Error {
     Error::Invalid(format!(
-        "{}: a token file is named by the host it is for, in lower case and without port 443",
+        "{}: a token file is named by the host it is for, in lower case, \
+         with `_` before a port and without port 443",
         path.display()
     ))
 }
@@ -177,7 +192,7 @@ mod tests {
             &tokens_dir.join("example.com"),
             " site-token \nsecond line\n",
         );
-        write(&tokens_dir.join("127.0.0.1:8080"), "with-port");
+        write(&tokens_dir.join("127.0.0.1_8080"), "with-port");
         write(&tokens_dir.join("empty.example.com"), "\n");
         write(&tokens_dir.join(".example.com.swp"), "editor");
 
@@ -200,7 +215,18 @@ mod tests {
 
     #[test]
     fn a_file_must_be_named_by_a_host_in_its_one_spelling() {
-        for name in ["Example.com", "example.com:443", "bad host"] {
+        let mut names = vec![
+            "Example.com",
+            "example.com_443",
+            "example.com_8080_1",
+            "under_score.example.com",
+            "bad host",
+        ];
+        // Windows takes `:` for a stream of the file named before it.
+        if cfg!(unix) {
+            names.push("127.0.0.1:8080");
+        }
+        for name in names {
             let dir = tempfile::tempdir().unwrap();
             write(&dir.path().join("mvault/tokens").join(name), "token");
             let env = env_of(&[("XDG_CONFIG_HOME", dir.path())]);
