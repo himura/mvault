@@ -1313,3 +1313,230 @@ fn update_leaves_a_pinned_model_alone() {
     );
     assert_eq!(upstream.requests().len(), requests);
 }
+
+/// The cells of the lines of a table, the header left out.
+fn cells(table: &str) -> Vec<Vec<String>> {
+    table
+        .lines()
+        .skip(1)
+        .map(|line| {
+            line.split("  ")
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .collect()
+}
+
+fn row(cells: &[&str]) -> Vec<String> {
+    cells.iter().map(|cell| (*cell).to_owned()).collect()
+}
+
+#[test]
+fn status_shows_each_model_with_what_this_node_and_the_mirror_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let model = "hf:huggingface.co:example-org/example-model (main)";
+    let add = [
+        "add",
+        "hf:example-org/example-model",
+        "--dest",
+        "models/x/",
+        "--path",
+        "config.json",
+    ];
+    run_in(&upstream, &workspace, &[], &add).result.unwrap();
+
+    let before = run_in(&upstream, &workspace, &[], &["status"]);
+    before.result.unwrap();
+    assert_eq!(
+        before.out,
+        format!(
+            "MODEL                                               RESOLVED      FETCHED  MIRROR\n\
+             {model}  {}  0/1      1/1\n",
+            &COMMIT[..12]
+        )
+    );
+
+    run_in(&upstream, &workspace, &[], &["sync"])
+        .result
+        .unwrap();
+    let assets = [
+        "add",
+        "hf:example-org/example-model",
+        "--dest",
+        "models/a/",
+        "--glob",
+        "assets/*",
+    ];
+    run_in(&upstream, &workspace, &[], &assets).result.unwrap();
+    let mut manifest = fs::read_to_string(workspace.join("mvault.toml")).unwrap();
+    manifest.push_str("\n[[model]]\nsource = \"hf:example-org/other\"\ndest = \"models/o/\"\n");
+    fs::write(workspace.join("mvault.toml"), manifest).unwrap();
+
+    let after = run_in(&upstream, &workspace, &[], &["status"]);
+    after.result.unwrap();
+    assert_eq!(
+        cells(&after.out),
+        [
+            row(&[model, &COMMIT[..12], "1/2", "1/2"]),
+            row(&[
+                "hf:huggingface.co:example-org/other (main)",
+                "not resolved",
+                "-",
+                "-"
+            ]),
+        ]
+    );
+
+    let one = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["status", "https://huggingface.co/example-org/other"],
+    );
+    one.result.unwrap();
+    assert_eq!(cells(&one.out).len(), 1);
+    let none = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["status", "hf:example-org/missing"],
+    );
+    assert!(
+        none.result
+            .unwrap_err()
+            .to_string()
+            .contains("the manifest has no model")
+    );
+
+    // Without a mirror, what it has is not known.
+    fs::remove_file(workspace.join(".mvault/config.toml")).unwrap();
+    let alone = run_in(
+        &upstream,
+        &workspace,
+        &[],
+        &["status", "hf:example-org/example-model"],
+    );
+    alone.result.unwrap();
+    assert_eq!(
+        cells(&alone.out),
+        [row(&[model, &COMMIT[..12], "1/2", "-"])]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_tells_the_state_of_each_file_the_way_sync_sees_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = Upstream::start();
+    let workspace = mirror_and_workspace(&upstream, dir.path());
+    let source = "hf:huggingface.co:example-org/example-model";
+    let config = &Sha256::of(b"{}").to_string()[..12];
+    let entry = |dest: &str, key: &str, path: &str| {
+        format!(
+            "\n[[model]]\nsource = \"hf:example-org/example-model\"\nfiles = [{{ {key} = \"{path}\", dest = \"{dest}\" }}]\n"
+        )
+    };
+    let manifest =
+        |entries: &[String]| fs::write(workspace.join("mvault.toml"), entries.concat()).unwrap();
+    let ls = |cwd: &Path, args: &[&str]| {
+        let mut command = vec!["ls"];
+        command.extend(args);
+        let run = run_in(&upstream, cwd, &[], &command);
+        run.result.unwrap();
+        (cells(&run.out), run.err)
+    };
+
+    manifest(&[entry("models/x/", "path", "config.json")]);
+    let (unresolved, warning) = ls(&workspace, &[]);
+    assert_eq!(unresolved, Vec::<Vec<String>>::new());
+    assert!(warning.contains("not resolved yet"), "{warning}");
+    run_in(&upstream, &workspace, &[], &["sync"])
+        .result
+        .unwrap();
+    manifest(&[
+        entry("models/x/", "path", "config.json"),
+        entry("models/a/", "glob", "assets/*"),
+    ]);
+    fs::write(workspace.join("models/x/mine.bin"), b"mine").unwrap();
+    // Files of the user show only when asked for.
+    let (listed, _) = ls(&workspace, &[]);
+    assert_eq!(listed.len(), 2);
+    let (listed, _) = ls(&workspace, &["--untracked"]);
+    assert_eq!(
+        listed,
+        [
+            row(&["models/a/sample.mp4", "not fetched", "6 B", "-", source]),
+            row(&["models/x/config.json", "placed", "2 B", config, source]),
+            row(&["models/x/mine.bin", "unmanaged", "4 B", "-", "-"]),
+        ]
+    );
+
+    // Moved in the manifest: the old place is dropped, the new one has
+    // its blob already, and a file of the user is in the way of another.
+    fs::create_dir_all(workspace.join("models/z")).unwrap();
+    fs::write(workspace.join("models/z/config.json"), b"mine").unwrap();
+    manifest(&[
+        entry("models/y/", "path", "config.json"),
+        entry("models/z/", "path", "config.json"),
+    ]);
+    let blob = workspace
+        .join(".mvault/blobs/sha256")
+        .join(&Sha256::of(b"{}").to_string()[..2])
+        .join(Sha256::of(b"{}").to_string());
+    fs::hard_link(&blob, workspace.join("models/x/old.json")).unwrap();
+    fs::create_dir_all(workspace.join("models/y")).unwrap();
+    let (listed, _) = ls(&workspace, &["--untracked"]);
+    assert_eq!(
+        listed,
+        [
+            row(&["models/x/config.json", "dropped", "2 B", config, "-"]),
+            row(&["models/x/mine.bin", "unmanaged", "4 B", "-", "-"]),
+            row(&["models/x/old.json", "unrecorded", "2 B", config, "-"]),
+            row(&["models/y/config.json", "fetched", "2 B", config, source]),
+            row(&["models/z/config.json", "conflict", "2 B", config, source]),
+        ]
+    );
+
+    // From a directory below the workspace, a path is taken from there.
+    let (below, _) = ls(&workspace.join("models"), &["y"]);
+    assert_eq!(
+        below,
+        [row(&[
+            "models/y/config.json",
+            "fetched",
+            "2 B",
+            config,
+            source
+        ])]
+    );
+    let outside = run_in(&upstream, &workspace, &[], &["ls", ".."]);
+    assert!(
+        outside
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("outside the workspace")
+    );
+
+    // A blob whose time changed may have been written to; ls does not
+    // read it to find out.
+    fs::File::open(&blob)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let (listed, _) = ls(&workspace, &["models/x/config.json"]);
+    assert_eq!(
+        listed,
+        [row(&[
+            "models/x/config.json",
+            "damaged?",
+            "2 B",
+            config,
+            "-"
+        ])]
+    );
+}

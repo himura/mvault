@@ -201,7 +201,7 @@ const WORKSPACE_LOCK: &str = "lock";
 
 /// `path` without `.` and with `..` taken away where it can be, without
 /// asking the filesystem.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut normal = PathBuf::new();
     for part in path.components() {
         match part {

@@ -226,7 +226,7 @@ pub fn sync(
     workspace.check_dests(placements.iter().map(|placement| placement.dest.as_str()))?;
     let record_path = workspace.placed_path();
     let mut record = Placed::load(&record_path)?;
-    let survey = survey(workspace, &placements, &record, options)?;
+    let survey = survey(workspace, &placements, &record, options, true)?;
 
     if options.dry_run {
         tell(&survey, &placements, &mut report, on_event);
@@ -438,6 +438,10 @@ fn tell(
 /// Looks at the destinations and the blobs, and decides what a sync does.
 /// Changes nothing.
 ///
+/// A blob whose size or modification time is not the recorded one is read
+/// again to tell whether it still has its digest. Without `verify` it is
+/// not, and taken for damaged.
+///
 /// # Errors
 ///
 /// Returns an error if a file or blob cannot be looked at.
@@ -446,9 +450,10 @@ pub(crate) fn survey(
     placements: &[Placement],
     record: &Placed,
     options: Options,
+    verify: bool,
 ) -> Result<Survey> {
     let store = &workspace.store;
-    let mut blobs = Blobs::new(store, record);
+    let mut blobs = Blobs::new(store, record, verify);
     let mut managed = Managed::new(store);
     let mut survey = Survey::default();
 
@@ -566,13 +571,14 @@ enum BlobState {
 /// its stamp differs from the one recorded.
 struct Blobs<'a> {
     store: &'a BlobStore,
+    verify: bool,
     recorded: HashMap<Sha256, Stamp>,
     known: HashMap<Sha256, BlobState>,
     restamped: BTreeMap<Sha256, Stamp>,
 }
 
 impl<'a> Blobs<'a> {
-    fn new(store: &'a BlobStore, record: &Placed) -> Self {
+    fn new(store: &'a BlobStore, record: &Placed, verify: bool) -> Self {
         let mut recorded = HashMap::new();
         for (_, entry) in record.iter() {
             recorded.entry(entry.sha256).or_insert(Stamp {
@@ -582,6 +588,7 @@ impl<'a> Blobs<'a> {
         }
         Self {
             store,
+            verify,
             recorded,
             known: HashMap::new(),
             restamped: BTreeMap::new(),
@@ -596,6 +603,10 @@ impl<'a> Blobs<'a> {
         let state = match Stamp::of(&path)? {
             None => BlobState::Missing,
             Some(stamp) => match self.recorded.get(&digest) {
+                Some(recorded) if *recorded != stamp && !self.verify => {
+                    debug!("blob {digest} changed its size or time since it was recorded");
+                    BlobState::Damaged
+                }
                 Some(recorded) if *recorded != stamp => {
                     debug!(
                         "blob {digest} changed its size or time since it was recorded; hashing it"
@@ -919,13 +930,13 @@ fn is_same(path: &Path, blob: &Path) -> Result<bool> {
 /// Tells whether a file is a hard link to one of the blobs. The blobs are
 /// listed once, on first use, and compared by size before anything is
 /// opened.
-struct Managed<'a> {
+pub(crate) struct Managed<'a> {
     store: &'a BlobStore,
     by_size: Option<HashMap<u64, Vec<PathBuf>>>,
 }
 
 impl<'a> Managed<'a> {
-    fn new(store: &'a BlobStore) -> Self {
+    pub(crate) fn new(store: &'a BlobStore) -> Self {
         Self {
             store,
             by_size: None,
@@ -958,7 +969,11 @@ impl<'a> Managed<'a> {
     /// The digest of the blob that the file at `path` is a hard link to:
     /// `recorded` if it is that one, any other otherwise. `None` if it is
     /// missing or not a hard link to a blob.
-    fn blob_of(&mut self, path: &Path, recorded: Option<Sha256>) -> Result<Option<Sha256>> {
+    pub(crate) fn blob_of(
+        &mut self,
+        path: &Path,
+        recorded: Option<Sha256>,
+    ) -> Result<Option<Sha256>> {
         if let Some(digest) = recorded
             && is_same(path, &self.store.blob_path(&digest))?
         {

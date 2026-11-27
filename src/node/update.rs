@@ -131,7 +131,7 @@ fn is_pinned(model: &Model) -> bool {
 
 /// Whether `given` on the command line names the model `source`: a model
 /// without a version names every version of it.
-fn matches(given: &Source, source: &Source) -> bool {
+pub(crate) fn matches(given: &Source, source: &Source) -> bool {
     match (given, source) {
         (
             Source::Civitai {

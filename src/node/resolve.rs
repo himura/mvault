@@ -210,7 +210,13 @@ fn read_ref(source: &Source, name: &str, access: &Access<'_>) -> Option<String> 
     (!revision.is_empty()).then_some(revision)
 }
 
-fn read_snapshot(source: &Source, revision: &str, access: &Access<'_>) -> Option<Snapshot> {
+/// The snapshot of `source` at `revision` from the first mirror that has a
+/// usable one.
+pub(crate) fn read_snapshot(
+    source: &Source,
+    revision: &str,
+    access: &Access<'_>,
+) -> Option<Snapshot> {
     let path = snapshot::snapshot_path(source, revision);
     let content = read_first(&path, access)?;
     match serde_json::from_slice::<Snapshot>(&content) {

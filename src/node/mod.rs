@@ -4,6 +4,7 @@
 pub mod add;
 pub mod config;
 pub mod gc;
+pub mod inspect;
 pub mod lock;
 pub mod manifest;
 pub mod placed;
