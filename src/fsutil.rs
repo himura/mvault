@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
 
+use log::debug;
+
 use crate::error::{Error, Result};
 
 /// Wraps an I/O error with the path it is about.
@@ -26,10 +28,32 @@ pub(crate) fn lock_file(path: &Path) -> Result<fs::File> {
             .write(true)
             .open(path)
             .map_err(io_error(path))?;
-        file.lock().map_err(io_error(path))?;
+        wait_for_lock(&file, path, true)?;
         if is_at(&file, path) {
             return Ok(file);
         }
+    }
+}
+
+/// Takes the lock on `file`, which is open at `path`: exclusive, or shared
+/// with other readers. Tells the log when another process makes it wait.
+pub(crate) fn wait_for_lock(file: &fs::File, path: &Path, exclusive: bool) -> Result<()> {
+    let tried = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match tried {
+        Ok(()) => return Ok(()),
+        Err(fs::TryLockError::WouldBlock) => {
+            debug!("waiting for {}: another process holds it", path.display());
+        }
+        Err(fs::TryLockError::Error(error)) => return Err(io_error(path)(error)),
+    }
+    if exclusive {
+        file.lock().map_err(io_error(path))
+    } else {
+        file.lock_shared().map_err(io_error(path))
     }
 }
 
@@ -64,7 +88,9 @@ pub(crate) fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     renamed?;
-    sync_dir(dir).map_err(io_error(dir))
+    sync_dir(dir).map_err(io_error(dir))?;
+    debug!("wrote {} ({} bytes)", path.display(), content.len());
+    Ok(())
 }
 
 /// Makes the creation, removal or rename of an entry of `dir` durable.

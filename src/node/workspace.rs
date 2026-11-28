@@ -15,9 +15,33 @@ use super::manifest::{LOCK_NAME, MANIFEST_NAME, STATE_DIR};
 use super::placed::PLACED_NAME;
 use super::remote::Remote;
 use crate::error::{Error, Result};
-use crate::fsutil::{io_error, write_atomic};
+use crate::fsutil::{io_error, wait_for_lock, write_atomic};
 use crate::source::Defaults;
 use crate::store::BlobStore;
+
+/// Tells the log where the workspace is and which settings are in effect.
+fn log_settings(root: &Path, config: &Config, blobs: &Path) {
+    log::debug!("workspace {}", root.display());
+    log::debug!("blobs in {}", blobs.display());
+    if config.mirrors.is_empty() {
+        log::debug!("no mirrors");
+    }
+    for mirror in &config.mirrors {
+        let shown = if mirror.contains("://") {
+            crate::download::redact(mirror)
+        } else {
+            mirror.clone()
+        };
+        log::debug!("mirror {shown}");
+    }
+    log::debug!(
+        "fetching from the upstream is {}allowed (allow_official)",
+        if config.allow_official { "" } else { "not " }
+    );
+    if let Some(host) = &config.civitai_host {
+        log::debug!("default Civitai host {host}");
+    }
+}
 
 const MANIFEST_TEMPLATE: &str = "\
 # The models of this workspace. `mvault add <URL> --dest <dir>/` appends an
@@ -69,6 +93,7 @@ impl Workspace {
             .unwrap_or_else(|| root.join(STATE_DIR).join("blobs"));
         // Unfinished files go next to the blobs, on the same filesystem.
         let tmp = blobs.parent().unwrap_or(&root).join("tmp");
+        log_settings(&root, &config, &blobs);
         Ok(Self {
             store: BlobStore::new(blobs, tmp),
             root,
@@ -116,11 +141,7 @@ impl Workspace {
             }
             Err(error) => return Err(io_error(&path)(error)),
         };
-        if create {
-            file.lock().map_err(io_error(&path))?;
-        } else {
-            file.lock_shared().map_err(io_error(&path))?;
-        }
+        wait_for_lock(&file, &path, create)?;
         Ok(Some(file))
     }
 

@@ -4,6 +4,8 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 
+use log::debug;
+
 use super::lock::{LockedFile, LockedModel};
 use super::manifest::Model;
 use super::remote::Remote;
@@ -88,6 +90,10 @@ pub fn resolve(model: &Model, access: &Access<'_>) -> Result<LockedModel> {
                 .and_then(|version| read_snapshot(&model.source, &version, access)),
         },
     };
+    let by_mirror = from_mirror.is_some();
+    if !by_mirror {
+        debug!("{source}: no mirror has a snapshot; asking the upstream");
+    }
     let (resolved, files) = match from_mirror {
         Some(snapshot) => (
             snapshot.revision,
@@ -113,6 +119,14 @@ pub fn resolve(model: &Model, access: &Access<'_>) -> Result<LockedModel> {
             }
         })?,
     };
+    debug!(
+        "{source}: resolved to {resolved} by {}",
+        if by_mirror {
+            "a mirror's snapshot"
+        } else {
+            "the upstream"
+        }
+    );
     Ok(LockedModel {
         source,
         revision: revision.map(str::to_owned),
@@ -146,6 +160,10 @@ pub fn fill_digests(locked: &mut LockedModel, access: &Access<'_>) -> Result<boo
             .find(|other| other.path == file.path && other.file_id == file.file_id)
             .and_then(|other| other.sha256);
         if let Some(digest) = known {
+            debug!(
+                "{}: digest of {} taken from a mirror's snapshot",
+                locked.source, file.path
+            );
             file.sha256 = Some(digest);
             filled = true;
         }
@@ -172,8 +190,11 @@ fn is_commit(revision: &str) -> bool {
 fn read_first(path: &str, access: &Access<'_>) -> Option<Vec<u8>> {
     for remote in access.usable_remotes() {
         match remote.read(access.http, path) {
-            Ok(Some(content)) => return Some(content),
-            Ok(None) => {}
+            Ok(Some(content)) => {
+                debug!("mirror {} has {path}", remote.redacted());
+                return Some(content);
+            }
+            Ok(None) => debug!("mirror {} does not have {path}", remote.redacted()),
             Err(error) => access.mirror_failed(remote, &error),
         }
     }
@@ -183,6 +204,9 @@ fn read_first(path: &str, access: &Access<'_>) -> Option<Vec<u8>> {
 fn read_ref(source: &Source, name: &str, access: &Access<'_>) -> Option<String> {
     let content = read_first(&snapshot::ref_path(source, name), access)?;
     let revision = String::from_utf8(content).ok()?.trim().to_owned();
+    if !revision.is_empty() {
+        debug!("{source}: {name} stands for {revision}");
+    }
     (!revision.is_empty()).then_some(revision)
 }
 

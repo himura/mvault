@@ -8,6 +8,8 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use log::debug;
+
 use crate::fsutil::sync_dir;
 use crate::hash::Sha256;
 
@@ -115,6 +117,7 @@ impl BlobStore {
     /// Returns an error if the file cannot be removed.
     pub fn remove(&self, digest: &Sha256) -> io::Result<()> {
         let path = self.blob_path(digest);
+        debug!("removing blob {}", path.display());
         let removed = fs::remove_file(&path).or_else(|error| {
             // On Unix whether a file can be removed depends on its directory
             // alone. Its mode is shared with every file placed as a link to
@@ -244,6 +247,11 @@ impl Prepared {
         // Another writer may have stored the blob since the file was
         // prepared.
         if dest.is_file() {
+            debug!(
+                "{} is stored already; removing {}",
+                dest.display(),
+                file.display()
+            );
             fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
             return Ok(Committed::AlreadyPresent);
         }
@@ -252,6 +260,11 @@ impl Prepared {
             // Losing the race against another writer of the same blob ends
             // up here: its blob stays as it is.
             if dest.is_file() {
+                debug!(
+                    "{} was stored by another writer meanwhile; removing {}",
+                    dest.display(),
+                    file.display()
+                );
                 fs::remove_file(&file).map_err(|e| with_path(&e, &file))?;
                 return Ok(Committed::AlreadyPresent);
             }
@@ -263,6 +276,7 @@ impl Prepared {
         if let Some(dir) = dest.parent() {
             sync_dir(dir).map_err(|e| with_path(&e, dir))?;
         }
+        debug!("stored {} as {}", file.display(), dest.display());
         Ok(Committed::Added)
     }
 }

@@ -11,6 +11,7 @@ pub mod error;
 mod fsutil;
 pub mod gc;
 pub mod hash;
+mod logger;
 pub mod mirror;
 pub mod node;
 pub mod snapshot;
@@ -28,8 +29,11 @@ pub mod upstream;
 /// Returns the error of the command that was run.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::Cli::parse();
+    let level = cli.log_level();
+    logger::init(level);
     let mut err = std::io::stderr();
-    let live = err.is_terminal();
+    // A line being redrawn would be torn apart by the lines of the log.
+    let live = err.is_terminal() && level == log::LevelFilter::Off;
     let mut context = cli::Context {
         env: &|name| std::env::var(name).ok(),
         base_url: &|host| format!("https://{host}"),

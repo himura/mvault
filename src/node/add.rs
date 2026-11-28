@@ -79,8 +79,11 @@ pub fn add(workspace: &Workspace, access: &Access<'_>, request: &Request<'_>) ->
     let (source, revision) = model.key();
     let mut lock_changed = false;
     if lock.get(&source, revision).is_none() {
+        log::debug!("{source}: not in the lock file; resolving it");
         lock.insert(resolve(&model, access)?);
         lock_changed = true;
+    } else {
+        log::debug!("{source}: resolved already in the lock file");
     }
     let resolved = lock
         .get(&source, revision)

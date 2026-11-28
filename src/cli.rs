@@ -24,8 +24,19 @@ pub struct Cli {
     /// (by default mvault in the config directory of the user)
     #[arg(long, env = "MVAULT_CONFIG_DIR", global = true, value_name = "DIR")]
     config_dir: Option<PathBuf>,
+    /// Write a log of what is done and why on stderr
+    #[arg(long, env = "MVAULT_LOG", global = true, value_name = "LEVEL")]
+    log: Option<crate::logger::Detail>,
     #[command(subcommand)]
     command: Command,
+}
+
+impl Cli {
+    /// The level of the log that `--log` asks for; off without it.
+    #[must_use]
+    pub fn log_level(&self) -> log::LevelFilter {
+        crate::logger::level(self.log)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -158,6 +169,7 @@ pub fn execute(cli: Cli, context: &mut Context<'_>) -> Result<()> {
             let root = mirror.root.ok_or_else(|| {
                 Error::Invalid("no mirror given: pass --root or set MVAULT_MIRROR_ROOT".into())
             })?;
+            log::debug!("mirror {}", root.display());
             match mirror.command {
                 MirrorCommand::Init => mirror_init(&root, context),
                 MirrorCommand::Pull(args) => pull(&root, &args, config_dir, context),

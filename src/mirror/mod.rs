@@ -11,6 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use log::debug;
+
 use crate::download::{Client, Progress, Request};
 use crate::error::{Error, Result};
 use crate::fsutil::{io_error, lock_file, write_atomic};
@@ -245,6 +247,10 @@ impl Mirror {
         let source = origin.to_string();
         let info = hub.repo_info(http, repo, revision)?;
         let commit = info.commit;
+        debug!(
+            "{source}: revision {revision} is commit {commit}, with {} file(s)",
+            info.files.len()
+        );
         let dir = snapshot::source_dir(&origin);
         write_atomic(
             &self
@@ -272,7 +278,13 @@ impl Mirror {
         let files = self.db.snapshot_files(snapshot_id)?;
         let jobs: Vec<Job<'_>> = files
             .iter()
-            .filter(|file| !excludes.matches(&file.path))
+            .filter(|file| {
+                let excluded = excludes.matches(&file.path);
+                if excluded {
+                    debug!("{}: excluded, not fetched", file.path);
+                }
+                !excluded
+            })
             .map(|file| Job {
                 file,
                 url: hub.file_url(repo, &commit, &file.path),
@@ -289,6 +301,10 @@ impl Mirror {
                 if revision == pulled.revision {
                     Ok(())
                 } else {
+                    debug!(
+                        "{}: {revision} now stands for {}",
+                        pulled.source, pulled.revision
+                    );
                     self.db.set_ref(&pulled.source, revision, &pulled.revision)
                 }
             });
@@ -334,6 +350,7 @@ impl Mirror {
             let (latest, raw) = site.model(http, model_id)?;
             let latest =
                 latest.ok_or_else(|| Error::Invalid(format!("{source} has no versions")))?;
+            debug!("{source}: the latest version is {latest}");
             (latest, Some(raw))
         };
         let version = site.version(http, version_id)?;
@@ -379,6 +396,7 @@ impl Mirror {
             })
             .collect();
         let wanted = select(&listed, selection, version_id)?;
+        log_selection(&listed, &wanted, selection);
 
         let revision = version_id.to_string();
         let snapshot_id = self.db.record_snapshot(&source, &revision, &listed)?;
@@ -405,6 +423,10 @@ impl Mirror {
             })
             .and_then(|()| {
                 if resolved_latest {
+                    debug!(
+                        "{}: latest now stands for {}",
+                        pulled.source, pulled.revision
+                    );
                     self.db.set_ref(&pulled.source, "latest", &pulled.revision)
                 } else {
                     Ok(())
@@ -445,6 +467,7 @@ impl Mirror {
                 path: &job.file.path,
             });
             let outcome = if job.file.fetched {
+                debug!("{}: fetched by an earlier pull", job.file.path);
                 Outcome::Present
             } else {
                 let headers = headers_for(&job.url);
@@ -492,6 +515,7 @@ impl Mirror {
         if let Some(digest) = &announced
             && self.db.use_stored_blob(snapshot_id, file.key(), digest)?
         {
+            debug!("{}: blob {digest} is stored already", file.path);
             return Ok(Outcome::Reused);
         }
 
@@ -507,16 +531,25 @@ impl Mirror {
             && self.db.use_stored_blob(snapshot_id, file.key(), digest)?
         {
             // Another process fetched it while this one waited for the lock.
+            debug!(
+                "{}: blob {digest} was stored by another process meanwhile",
+                file.path
+            );
             return Ok(Outcome::Reused);
         }
         if self.db.is_fetched(snapshot_id, file.key())? {
             // The same, for a file whose digest was not announced.
+            debug!("{}: fetched by another process meanwhile", file.path);
             return Ok(Outcome::Present);
         }
 
         if announced.is_none() {
             // Without a digest to compare with, the beginning left by an
             // earlier run cannot be told from that of a replaced file.
+            debug!(
+                "{}: no digest announced, so a partial file is not continued",
+                file.path
+            );
             remove_if_exists(&partial)?;
         }
         let request = Request {
@@ -542,6 +575,7 @@ impl Mirror {
             _ => None,
         };
         if let Some(reason) = mismatch {
+            debug!("{}: {reason}; removing {}", file.path, partial.display());
             remove_if_exists(&partial)?;
             return Err(Error::Upstream {
                 url: job.url.clone(),
@@ -551,6 +585,12 @@ impl Mirror {
 
         // Flushing a large file takes long; it is done before the database is
         // locked, so that other pulls are not kept waiting for it.
+        debug!(
+            "{}: storing {} as blob {}",
+            file.path,
+            partial.display(),
+            downloaded.sha256
+        );
         let prepared = self
             .store
             .prepare(&partial, &downloaded.sha256)
@@ -602,6 +642,7 @@ impl Mirror {
             // their files exist no longer matters.
             let unused = blobs.iter().any(|(blob, _)| blob == digest);
             if !unused && !store.find(digest).map_err(Error::Store)? {
+                debug!("blob {digest} is in the database, but its file is gone");
                 let snapshots = self
                     .db
                     .blob_snapshots(digest)?
@@ -771,6 +812,30 @@ fn select(listed: &[FileEntry], selection: &Selection, version_id: u64) -> Resul
                 }
             }
             Ok(ids.clone())
+        }
+    }
+}
+
+/// Tells which files of a version `selection` chose, and which it left out.
+fn log_selection(listed: &[FileEntry], wanted: &[u64], selection: &Selection) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let asked = match selection {
+        Selection::Primary => "the primary file".to_owned(),
+        Selection::All => "every file".to_owned(),
+        Selection::Files(ids) => format!(
+            "file id {}",
+            ids.iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    debug!("selected {asked} of {} file(s)", listed.len());
+    for file in listed {
+        if file.file_id.is_some_and(|id| !wanted.contains(&id)) {
+            debug!("{}: not selected, not fetched", file.path);
         }
     }
 }

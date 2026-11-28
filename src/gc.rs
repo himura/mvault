@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use log::debug;
+
 use crate::error::Result;
 use crate::fsutil::{io_error, is_at};
 use crate::hash::Sha256;
@@ -64,6 +66,7 @@ pub fn clean_tmp(tmp: &Path, max_age: Duration, dry_run: bool) -> Result<Vec<Pat
         if let Some(lock) = &lock
             && (lock.try_lock().is_err() || !is_at(lock, &lock_path))
         {
+            debug!("{}: a download is running; kept", partial.display());
             continue;
         }
         let stale = match fs::metadata(&partial) {
@@ -78,9 +81,11 @@ pub fn clean_tmp(tmp: &Path, max_age: Duration, dry_run: bool) -> Result<Vec<Pat
         };
         let exists = partial.exists();
         if exists && !stale {
+            debug!("{}: changed recently; kept", partial.display());
             continue;
         }
         if exists {
+            debug!("{}: given up long ago; removing it", partial.display());
             if !dry_run {
                 fs::remove_file(&partial).map_err(io_error(&partial))?;
             }

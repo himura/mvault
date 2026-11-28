@@ -39,9 +39,13 @@ impl Config {
         let path = root.join("private").join("config.toml");
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::debug!("no settings in {}", path.display());
+                return Ok(Self::default());
+            }
             Err(error) => return Err(io_error(&path)(error)),
         };
+        log::debug!("reading the settings in {}", path.display());
         let invalid = |reason: String| Error::Invalid(format!("{}: {reason}", path.display()));
         let mut config: Self = toml::from_str(&text).map_err(|e| invalid(e.to_string()))?;
         // Taken into sources, which spell a host one way.

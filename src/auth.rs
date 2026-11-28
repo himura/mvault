@@ -68,7 +68,15 @@ impl<'a> Tokens<'a> {
             return Ok(token.clone());
         }
         let mut token = match &self.dir {
-            Some(dir) => read_token(dir.join(file_name_of_host(host)))?,
+            Some(dir) => {
+                let path = dir.join(file_name_of_host(host));
+                let shown = path.display().to_string();
+                let token = read_token(path)?;
+                if token.is_some() {
+                    log::debug!("token for {host} from {shown}");
+                }
+                token
+            }
             None => None,
         };
         if token.is_none() && host == DEFAULT_HF_HOST {
@@ -110,6 +118,7 @@ fn file_name_of_host(host: &str) -> String {
 /// [`Tokens::get`]). A token file that exists must be readable.
 fn hf_token(env: Env<'_>) -> Result<Option<String>> {
     if let Some(token) = non_empty(env("HF_TOKEN")) {
+        log::debug!("token for {DEFAULT_HF_HOST} from HF_TOKEN");
         return Ok(Some(token));
     }
     let path = non_empty(env("HF_TOKEN_PATH"))
@@ -123,7 +132,15 @@ fn hf_token(env: Env<'_>) -> Result<Option<String>> {
             })?;
             Some(home.join("token"))
         });
-    path.map_or(Ok(None), read_token)
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let shown = path.display().to_string();
+    let token = read_token(path)?;
+    if token.is_some() {
+        log::debug!("token for {DEFAULT_HF_HOST} from {shown}");
+    }
+    Ok(token)
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
