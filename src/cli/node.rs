@@ -10,9 +10,12 @@ use crate::auth::Tokens;
 use crate::error::{Error, Result};
 use crate::node::add::{self, Added};
 use crate::node::config::global_path;
+use crate::node::inspect::{self, OnMirror};
 use crate::node::manifest::MANIFEST_NAME;
 use crate::node::resolve::Access;
+use crate::node::resolve::is_commit;
 use crate::node::sync::{self, Event, Options};
+use crate::node::update::{self, Outcome, Updated};
 use crate::node::workspace::{self, Workspace};
 use crate::source::Reference;
 use crate::upstream::civitai::Site;
@@ -78,6 +81,32 @@ pub(super) struct SyncArgs {
     /// that were written to
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct UpdateArgs {
+    /// Models to resolve again, as page URLs or canonical forms
+    /// [default: every model of the manifest]
+    #[arg(value_name = "SOURCE")]
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct LsArgs {
+    /// Also list the other files in the directories models are placed in:
+    /// links to blobs that are not recorded, and files of the user
+    #[arg(long)]
+    untracked: bool,
+    /// Only what is at this path or below it [default: the whole workspace]
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct StatusArgs {
+    /// Only this model, as a page URL or canonical form
+    #[arg(value_name = "SOURCE")]
+    source: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +279,133 @@ pub(super) fn sync(
     } else {
         Err(Error::Invalid(problems.join("; ")))
     }
+}
+
+pub(super) fn update(
+    args: &UpdateArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
+    let sources = args
+        .sources
+        .iter()
+        .map(|text| {
+            Reference::parse(text, &workspace.defaults())
+                .map(|reference| reference.source)
+                .map_err(|e| Error::Invalid(e.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let updated = with_access(&workspace, config_dir, context, |access, _| {
+        update::update(&workspace, access, &sources)
+    })?;
+    let mut moved = false;
+    for Updated { model, outcome } in &updated {
+        let line = match outcome {
+            Outcome::Moved { before, after } => {
+                moved = true;
+                format!("{model}: {before} -> {after}")
+            }
+            Outcome::Resolved(after) => {
+                moved = true;
+                format!("{model}: resolved to {after}")
+            }
+            Outcome::Unchanged(after) => format!("{model}: still {after}"),
+            Outcome::Pinned => format!("{model}: pinned by the manifest"),
+        };
+        say(context, &line)?;
+    }
+    if moved {
+        say(context, "mvault sync places what changed")?;
+    }
+    Ok(())
+}
+
+pub(super) fn ls(
+    args: &LsArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
+    let under = match &args.path {
+        Some(path) => inspect::relative_to(&workspace.root, &context.cwd, path)?,
+        None => String::new(),
+    };
+    let listing = inspect::ls(&workspace, &under, args.untracked)?;
+    if !listing.unresolved.is_empty() {
+        let _ = writeln!(
+            context.err,
+            "warning: the files of {} are not listed: not resolved yet (mvault sync resolves them)",
+            listing.unresolved.join(", ")
+        );
+    }
+    if listing.files.is_empty() {
+        return Ok(());
+    }
+    let mut rows = vec![["PATH", "STATE", "SIZE", "SHA256", "SOURCE"].map(str::to_owned)];
+    rows.extend(listing.files.iter().map(|file| {
+        [
+            file.dest.clone(),
+            file.state.word().to_owned(),
+            file.size.map_or_else(|| "-".to_owned(), super::human_size),
+            file.sha256.map_or_else(
+                || "-".to_owned(),
+                |digest| digest.to_string()[..12].to_owned(),
+            ),
+            file.source.clone().unwrap_or_else(|| "-".to_owned()),
+        ]
+    }));
+    write!(context.out, "{}", super::table(&rows, ""))
+        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
+}
+
+pub(super) fn status(
+    args: &StatusArgs,
+    config_dir: Option<&Path>,
+    context: &mut Context<'_>,
+) -> Result<()> {
+    let workspace = open(config_dir, context)?;
+    let filter = args
+        .source
+        .as_deref()
+        .map(|text| {
+            Reference::parse(text, &workspace.defaults())
+                .map(|reference| reference.source)
+                .map_err(|e| Error::Invalid(e.to_string()))
+        })
+        .transpose()?;
+    let statuses = with_access(&workspace, config_dir, context, |access, _| {
+        inspect::status(&workspace, access, filter.as_ref())
+    })?;
+    if statuses.is_empty() {
+        return match filter {
+            Some(source) => Err(Error::Invalid(format!(
+                "the manifest has no model {source}"
+            ))),
+            None => Ok(()),
+        };
+    }
+    let mut rows = vec![["MODEL", "RESOLVED", "FETCHED", "MIRROR"].map(str::to_owned)];
+    for status in &statuses {
+        let resolved = match &status.resolved {
+            Some(resolved) if is_commit(resolved) => resolved[..12].to_owned(),
+            Some(resolved) => resolved.clone(),
+            None => "not resolved".to_owned(),
+        };
+        let (fetched, mirror) = if status.resolved.is_some() {
+            let mirror = match status.mirror {
+                OnMirror::Unknown => "-".to_owned(),
+                OnMirror::Missing => "none".to_owned(),
+                OnMirror::Has(count) => format!("{count}/{}", status.files),
+            };
+            (format!("{}/{}", status.fetched, status.files), mirror)
+        } else {
+            ("-".to_owned(), "-".to_owned())
+        };
+        rows.push([status.model.clone(), resolved, fetched, mirror]);
+    }
+    write!(context.out, "{}", super::table(&rows, ""))
+        .map_err(|e| Error::Invalid(format!("cannot write the result: {e}")))
 }
 
 fn open(config_dir: Option<&Path>, context: &Context<'_>) -> Result<Workspace> {
